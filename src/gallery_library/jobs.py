@@ -21,6 +21,7 @@ _lock = threading.Lock()
 _job: Optional[dict] = None
 _cancel = threading.Event()
 _MAX_CONSECUTIVE_TAG_FAILURES = 5
+_WAIT_POLL_SECONDS = 5   # how often the scheduled task checks whether a manual scan has finished
 
 
 class JobAlreadyRunning(RuntimeError):
@@ -82,16 +83,27 @@ def start(source_id: str, *, embed: bool = True, tag: bool = False, faces: bool 
 
 
 def run_now(source_id: str, *, embed: bool = True, tag: bool = False, faces: bool = False, trigger: str = "task",
-            wait_seconds: float = 6 * 3600) -> dict:
+            wait_seconds: float = 6 * 3600, stop: Optional[threading.Event] = None) -> dict:
     """Run a job in the calling thread (the scheduled task) and return its final status.
 
     If a manual scan is running, waits for it first instead of failing.
+    Setting ``stop`` (the task was cancelled) ends the wait without starting a
+    job, or stops this call's job if it has already started.
     """
     deadline = time.monotonic() + wait_seconds
-    while _claim(source_id, embed, tag, trigger, faces) is None:
+    while True:
+        if stop is not None and stop.is_set():
+            return {"state": "cancelled", "source_id": source_id, "trigger": trigger, "result": {}}
+        if _claim(source_id, embed, tag, trigger, faces) is not None:
+            break
         if time.monotonic() > deadline:
             raise JobAlreadyRunning("Another indexing job kept running")
-        time.sleep(5)
+        if stop is not None:
+            stop.wait(_WAIT_POLL_SECONDS)
+        else:
+            time.sleep(_WAIT_POLL_SECONDS)
+    if stop is not None and stop.is_set():
+        _cancel.set()   # cancelled right as the job was claimed: stop it at once
     _run(source_id, bool(embed), bool(tag), bool(faces))
     return status() or {}
 

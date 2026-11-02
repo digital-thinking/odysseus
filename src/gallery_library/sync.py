@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
@@ -114,9 +115,10 @@ async def run_index_task(owner: str, progress_cb: Optional[Callable[[str], None]
 
     lines, worked, all_ok = [], False, True
     for source_id, name, options in sources:
+        stop = threading.Event()
         run = asyncio.ensure_future(asyncio.to_thread(
             jobs.run_now, source_id, embed=options["embed"], tag=options["tag"], faces=options["faces"],
-            trigger="task"))
+            trigger="task", stop=stop))
         try:
             while not run.done():
                 current = jobs.status()
@@ -128,7 +130,11 @@ async def run_index_task(owner: str, progress_cb: Optional[Callable[[str], None]
             # The scheduler stops background work when Odysseus is used (or the
             # user stops the run): stop the indexing thread too, at its next
             # photo / batch. The next run continues where this one stopped.
-            if jobs.is_running(source_id):
+            # Only this task's own job: a manual scan it was waiting for keeps going.
+            stop.set()
+            current = jobs.status() or {}
+            if (current.get("state") == "running" and current.get("source_id") == source_id
+                    and current.get("trigger") == "task"):
                 jobs.cancel()
             raise
         line, did_work, ok = _summary(name, run.result())

@@ -397,6 +397,38 @@ def test_index_task_yields_to_the_user_and_stops_its_indexing_thread(lib, fake_i
     assert _wait_for_job()["state"] == "cancelled"
 
 
+def test_index_task_waiting_for_a_manual_scan_leaves_it_running_when_stopped(lib, fake_index, monkeypatch):
+    """A long manual scan is still running when the nightly task fires; the task
+    waits. If the user then opens Odysseus, only the waiting task stops — the
+    manual scan carries on and no second run starts behind it."""
+    import asyncio
+    import threading
+    from src.builtin_actions import action_index_gallery_library
+    from src.gallery_library import embeddings, jobs
+    release = threading.Event()
+    monkeypatch.setattr(embeddings, "index_images", lambda items, cancel=None, **kw: (release.wait(10), len(items))[1])
+    monkeypatch.setattr(jobs, "_WAIT_POLL_SECONDS", 0.02)
+    source_id = _add_source(lib, path=HOST_ROOT, include_paths=["2005"], name="Privat").json()["source"]["id"]
+    jobs.start(source_id, embed=True)   # the manual scan (Scan now)
+    while (jobs.status() or {}).get("phase") != "embedding":
+        time.sleep(0.01)
+
+    async def scenario():
+        run = asyncio.ensure_future(action_index_gallery_library("alice"))
+        await asyncio.sleep(0.2)   # the task is waiting for the manual scan
+        run.cancel()               # the user opens Odysseus
+        with pytest.raises(asyncio.CancelledError):
+            await run
+
+    asyncio.run(scenario())
+    manual = jobs.status()
+    assert (manual["trigger"], manual["state"]) == ("manual", "running")
+    release.set()
+    assert _wait_for_job()["state"] == "done"
+    time.sleep(0.2)
+    assert jobs.status()["trigger"] == "manual"   # the task's waiting thread gave up
+
+
 def test_the_gallery_progress_poll_does_not_count_as_user_activity():
     from src.interactive_gate import should_track_interactive_request
     assert should_track_interactive_request("/api/gallery/sources/job", "GET") is False
