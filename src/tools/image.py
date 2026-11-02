@@ -63,11 +63,21 @@ async def do_edit_image(content: str, owner: Optional[str] = None, *, incognito:
         if not source:
             return {"error": "Image not found", "exit_code": 1}
 
-        root = Path(GENERATED_IMAGES_DIR).resolve()
-        source_name = Path(str(source.filename or "")).name
-        source_path = (root / source_name).resolve()
-        if source_name != source.filename or source_path.parent != root or not source_path.is_file():
-            return {"error": "Image file not found", "exit_code": 1}
+        from src.gallery_library.files import is_library_image, library_file_path
+        root = Path(GENERATED_IMAGES_DIR).resolve()  # where edit results are written
+        if is_library_image(source):
+            # Read-only library original: read it here, the edit becomes a new gallery image.
+            try:
+                source_path = Path(library_file_path(source, db))
+            except FileNotFoundError:
+                return {"error": "Image file not found", "exit_code": 1}
+            if not source_path.is_file():
+                return {"error": "Image file not found", "exit_code": 1}
+        else:
+            source_name = Path(str(source.filename or "")).name
+            source_path = (root / source_name).resolve()
+            if source_name != source.filename or source_path.parent != root or not source_path.is_file():
+                return {"error": "Image file not found", "exit_code": 1}
 
         if action == "prompt":
             from src.settings import load_settings

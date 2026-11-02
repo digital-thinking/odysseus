@@ -302,6 +302,9 @@ HOUSEKEEPING_DEFAULTS = {
     "classify_events":      {"name": "Calendar Classify Events", "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 6,18 * * *", "ship_paused": True, "legacy_names": ["Classify Calendar Events"]},
     "check_email_urgency":   {"name": "Email Tags",               "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 * * * *", "ship_paused": True, "old_cron_expressions": ["*/15 * * * *"], "legacy_names": ["Email Triage", "Urgent Email"]},
     "audit_skills":          {"name": "Skills Audit",             "trigger_type": "schedule", "schedule": "daily", "scheduled_time": "02:00", "cron_expression": None, "legacy_names": ["Audit Skills"]},
+    # user_schedule: the user may change when it runs (cron); ensure_defaults
+    # then keeps their schedule instead of reverting it to the default.
+    "index_gallery_library": {"name": "Gallery Library Index",    "trigger_type": "schedule", "schedule": "cron",  "scheduled_time": None,    "cron_expression": "0 3 * * *", "user_schedule": True},
 }
 
 RETIRED_HOUSEKEEPING_ACTIONS = frozenset({
@@ -2634,7 +2637,7 @@ class TaskScheduler:
                             tz_name=_resolve_task_timezone(db, task),
                         )
                         normalized = True
-                if desired_trigger == "schedule" and (
+                if desired_trigger == "schedule" and not defs.get("user_schedule") and (
                     (task.trigger_type or "schedule") != "schedule"
                     or task.trigger_event is not None
                     or task.trigger_count is not None

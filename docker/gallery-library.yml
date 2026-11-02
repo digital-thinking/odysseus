@@ -1,0 +1,18 @@
+# Read-only photo library for the gallery. Enable by setting in .env:
+#   COMPOSE_FILE=docker-compose.yml:docker/gallery-library.yml
+#   COMPOSE_FILE=docker-compose.yml;docker/gallery-library.yml    #(Windows)
+#   ODYSSEUS_GALLERY_LIBRARY_DIR=/home/you/Pictures                #(or H:/Pictures on Windows)
+#
+# The folder is mounted READ-ONLY at /library: Odysseus can show, tag and
+# search the photos, but the kernel refuses any write, rename or delete.
+# Thumbnails, tags and the smart-search index live in Odysseus's own data.
+#
+# ODYSSEUS_GALLERY_LIBRARY_MOUNTS maps the host path to the mount, so in
+# Gallery -> Settings -> Library folders you can enter the path as you know it
+# (e.g. H:\Pictures\2005); it is also the allowlist of indexable folders.
+services:
+  odysseus:
+    volumes:
+      - ${ODYSSEUS_GALLERY_LIBRARY_DIR:?set ODYSSEUS_GALLERY_LIBRARY_DIR}:/library:ro
+    environment:
+      - ODYSSEUS_GALLERY_LIBRARY_MOUNTS=${ODYSSEUS_GALLERY_LIBRARY_DIR:?set ODYSSEUS_GALLERY_LIBRARY_DIR}=/library

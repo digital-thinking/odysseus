@@ -154,6 +154,13 @@ let _activeAlbum = null;
 let _galleryCascaded = false;   // play the domino-in cascade once per open
 let _favoritesOnly = false;
 let _sort = 'recent';
+// Read-only library folders (Gallery → Settings → Library folders).
+// `_activeFolder` = { source, path, label } or null; `_folders` = folder tree.
+let _folders = [];
+let _activeFolder = null;
+// ✨ Smart search ranks photos by what they show (embedding index) instead
+// of matching words in names and tags.
+let _smart = false;
 let _shuffleSeed = Math.floor(Math.random() * 2 ** 31);
 let _offset = 0;
 // Page size — computed from the grid's visible area so taller / wider
@@ -207,12 +214,24 @@ async function _fetchLibrary(append) {
   const params = new URLSearchParams({ sort: _sort, offset: _offset, limit: _limit });
   if (_sort === 'shuffle') params.set('seed', String(_shuffleSeed));
   if (_search) params.set('search', _search);
+  if (_search && _smart) params.set('semantic', 'true');
   if (_activeTags.length) params.set('tag', _activeTags.join(','));
   if (_activeModel) params.set('model', _activeModel);
   if (_activeAlbum) params.set('album', _activeAlbum);
   if (_favoritesOnly) params.set('favorites', 'true');
+  if (_activeFolder) {
+    params.set('source', _activeFolder.source);
+    if (_activeFolder.path) params.set('folder', _activeFolder.path);
+  }
   try {
     const res = await fetch(`${API_BASE}/api/gallery/library?${params}`, { credentials: 'same-origin' });
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.json()).detail || ''; } catch (_) {}
+      if (_smart && _search) uiModule.showError(detail || 'Smart search failed');
+      else console.error('Gallery fetch failed:', res.status, detail);
+      return;
+    }
     const data = await res.json();
     if (append) {
       _items = _items.concat(data.items || []);
@@ -222,7 +241,7 @@ async function _fetchLibrary(append) {
     // Cache an "empty" verdict so the next open of an empty gallery doesn't
     // flash skeleton tiles before the real "No photos yet" message.
     try {
-      const _noFilters = !_search && !_activeTags.length && !_activeModel && !_activeAlbum && !_favoritesOnly;
+      const _noFilters = !_search && !_activeTags.length && !_activeModel && !_activeAlbum && !_favoritesOnly && !_activeFolder;
       if (_noFilters) {
         if (_items.length === 0) localStorage.setItem('gallery-known-empty', '1');
         else localStorage.removeItem('gallery-known-empty');
@@ -492,6 +511,382 @@ function _renderModels(models) {
   sel.innerHTML = html;
 }
 
+// ---- Library folders (read-only photo sources) ----
+
+function _syncSmartButton() {
+  const btn = document.getElementById('gallery-smart-btn');
+  const input = document.getElementById('gallery-search');
+  if (btn) {
+    btn.classList.toggle('active', _smart);
+    btn.setAttribute('aria-pressed', _smart ? 'true' : 'false');
+  }
+  if (input) input.placeholder = _smart ? 'Describe a photo… (smart search)' : 'Search photos, tags...';
+}
+
+async function _fetchFolders() {
+  try {
+    const res = await fetch(`${API_BASE}/api/gallery/folders`, { credentials: 'same-origin' });
+    _folders = res.ok ? ((await res.json()).folders || []) : [];
+  } catch (_) {
+    _folders = [];
+  }
+  _renderFolders();
+}
+
+function _folderValue(f) { return `${f.source_id}|${f.path}`; }
+
+function _renderFolders() {
+  const sel = document.getElementById('gallery-folder-filter');
+  if (!sel) return;
+  if (!_folders.length) {
+    sel.style.display = 'none';
+    sel.innerHTML = '';
+    return;
+  }
+  sel.style.display = '';
+  const current = _activeFolder ? `${_activeFolder.source}|${_activeFolder.path}` : '';
+  let html = '<option value="">All folders</option>';
+  for (const f of _folders) {
+    const parts = f.path ? f.path.split('/') : [];
+    const name = parts.length ? parts[parts.length - 1] : f.source_name;
+    const indent = '   '.repeat(parts.length);
+    const val = _folderValue(f);
+    html += `<option value="${_esc(val)}"${val === current ? ' selected' : ''}>${indent}${_esc(name)} (${f.count})</option>`;
+  }
+  sel.innerHTML = html;
+}
+
+function _setFolderFilter(value) {
+  if (!value) {
+    _activeFolder = null;
+  } else {
+    const f = _folders.find(x => _folderValue(x) === value);
+    const i = value.indexOf('|');
+    _activeFolder = {
+      source: value.slice(0, i),
+      path: value.slice(i + 1),
+      label: f ? [f.source_name, f.path].filter(Boolean).join(' / ') : value.slice(i + 1),
+    };
+    // A photo folder reads best in the order the photos were taken.
+    if (_sort !== 'taken_asc' && _sort !== 'taken_desc') {
+      _sort = 'taken_asc';
+      const sortSel = document.getElementById('gallery-sort');
+      if (sortSel) sortSel.value = _sort;
+    }
+  }
+  const sel = document.getElementById('gallery-folder-filter');
+  if (sel) sel.value = value || '';
+  _fetchLibrary(false);
+  _renderAlbums();
+}
+
+let _libraryPoll = null;
+
+function _scanTime(iso) {
+  if (!iso) return 'never';
+  const d = new Date(iso);
+  if (isNaN(d)) return 'never';
+  const mins = Math.round((Date.now() - d.getTime()) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours} h ago`;
+  return d.toLocaleDateString();
+}
+
+// "0 3 * * *" → "daily at 03:00 UTC"; anything else is shown as the raw cron.
+function _cronText(cron) {
+  const m = /^(\d{1,2}) (\d{1,2}) \* \* \*$/.exec((cron || '').trim());
+  if (m) return `daily at ${m[2].padStart(2, '0')}:${m[1].padStart(2, '0')} UTC`;
+  return cron ? `cron “${cron}” (UTC)` : 'no schedule';
+}
+
+function _inText(iso) {
+  if (!iso) return '';
+  const mins = Math.round((new Date(iso).getTime() - Date.now()) / 60000);
+  if (isNaN(mins)) return '';
+  if (mins <= 1) return 'in a moment';
+  if (mins < 60) return `in ${mins} min`;
+  const hours = Math.round(mins / 60);
+  return hours < 48 ? `in ${hours} h` : new Date(iso).toLocaleDateString();
+}
+
+// New photos are picked up by the scheduled "Gallery Library Index" task.
+function _renderIndexTask(task) {
+  const box = document.getElementById('gallery-index-task');
+  if (!box) return;
+  if (!task) {
+    box.innerHTML = 'New photos are picked up by the scheduled task <strong>Gallery Library Index</strong> — it appears in Tasks after the next restart.';
+    return;
+  }
+  const paused = task.status !== 'active';
+  const when = paused
+    ? '<strong>paused</strong> — new photos are only added when you click Scan now'
+    : `${_esc(_cronText(task.cron_expression))}${task.next_run ? ` · next run ${_esc(_inText(task.next_run))}` : ''}`;
+  box.innerHTML = `New photos are picked up by the task <strong>${_esc(task.name)}</strong>: ${when}. `
+    + `<a href="#" class="gallery-index-task-link" data-task-id="${_esc(task.id)}">Schedule or pause it in Tasks</a>`;
+}
+
+function _scanSummary(stats) {
+  if (!stats || !Object.keys(stats).length) return 'Not scanned yet';
+  const bits = [];
+  if (stats.new) bits.push(`${stats.new} new`);
+  if (stats.updated) bits.push(`${stats.updated} updated`);
+  if (stats.missing) bits.push(`${stats.missing} no longer in the folder`);
+  if (stats.skipped_videos) bits.push(`${stats.skipped_videos} videos skipped`);
+  if (stats.errors) bits.push(`${stats.errors} unreadable`);
+  if (stats.tagging && stats.tagging.error) bits.push(`tagging stopped: ${stats.tagging.error}`);
+  return bits.join(' · ') || 'Up to date';
+}
+
+async function _loadLibrarySources() {
+  const card = document.getElementById('gallery-library-card');
+  if (!card) return;
+  let data;
+  try {
+    const res = await fetch(`${API_BASE}/api/gallery/sources`, { credentials: 'same-origin' });
+    if (!res.ok) { card.style.display = 'none'; return; }   // admins only
+    data = await res.json();
+  } catch (_) {
+    card.style.display = 'none';
+    return;
+  }
+  card.style.display = '';
+  const list = document.getElementById('gallery-sources-list');
+  const hint = document.getElementById('gallery-source-hint');
+  const count = document.getElementById('gallery-library-count');
+  const sources = data.sources || [];
+  const photos = sources.reduce((n, src) => n + (src.photo_count || 0), 0);
+  if (count) count.textContent = sources.length ? `${photos} photos` : '';
+  if (hint) {
+    hint.textContent = (data.mounts || []).length
+      ? `Allowed locations: ${data.mounts.join(' · ')}`
+      : 'No library locations are configured on the server yet — set ODYSSEUS_GALLERY_LIBRARY_MOUNTS (see docker/gallery-library.yml).';
+  }
+  if (list) {
+    list.innerHTML = sources.map(src => `
+      <div class="gallery-source-row" data-id="${_esc(src.id)}">
+        <div class="gallery-source-main">
+          <div class="gallery-source-name">${_esc(src.name)} <span class="gallery-source-ro" title="Odysseus never writes to this folder">read-only</span></div>
+          <div class="gallery-source-path">${_esc(src.path)}${(src.include_paths || []).length ? ` · only ${_esc(src.include_paths.join(', '))}` : ''}</div>
+          <div class="gallery-source-stats">${src.photo_count} photos · ${src.tagged_count} AI-tagged · scanned ${_esc(_scanTime(src.last_scan_at))}<br>${_esc(_scanSummary(src.last_scan_stats))}</div>
+        </div>
+        <div class="gallery-source-actions">
+          <label title="Add new photos to the ✨ smart-search index"><input type="checkbox" class="gallery-source-opt-embed"${src.sync?.embed === false ? '' : ' checked'}> Smart search</label>
+          <label title="AI-tag new photos (tagging model below)"><input type="checkbox" class="gallery-source-opt-tag"${src.sync?.tag ? ' checked' : ''}> AI tags</label>
+          <button class="memory-toolbar-btn gallery-source-edit" data-include="${_esc((src.include_paths || []).join(', '))}" title="Choose which subfolders are included">Subfolders</button>
+          <button class="memory-toolbar-btn gallery-source-scan" title="Scan now (only new or changed photos are processed)">Scan now</button>
+          <button class="memory-toolbar-btn gallery-source-remove" title="Forget this folder in Odysseus — the photos themselves are not touched">Remove</button>
+        </div>
+      </div>`).join('');
+  }
+  _renderIndexTask(data.index_task);
+  _renderLibraryJob(data.job);
+  if (data.job && data.job.state === 'running') _pollLibraryJob();
+}
+
+function _renderLibraryJob(job) {
+  const box = document.getElementById('gallery-library-job');
+  if (!box) return;
+  if (!job) { box.style.display = 'none'; return; }
+  box.style.display = '';
+  const bar = document.getElementById('gallery-library-job-progress');
+  const status = document.getElementById('gallery-library-job-status');
+  const cancel = document.getElementById('gallery-library-job-cancel');
+  const running = job.state === 'running';
+  const pct = job.total ? Math.round((job.done / job.total) * 100) : (running ? 3 : 100);
+  if (bar) bar.style.width = `${pct}%`;
+  const phase = {
+    starting: 'Starting', listing: 'Listing files', scanning: 'Reading photos and making thumbnails',
+    embedding: 'Building the smart-search index', tagging: 'AI-tagging photos',
+    done: 'Done', cancelled: 'Cancelled', error: 'Failed',
+  }[job.phase] || job.phase;
+  let text = running && job.total ? `${phase} — ${job.done}/${job.total}` : phase;
+  if (job.trigger === 'task') text = `Scheduled index: ${text}`;
+  if (job.state === 'error' && job.error) text += `: ${job.error}`;
+  if (!running && job.result) {
+    const r = job.result;
+    const bits = [];
+    if (r.scan) bits.push(`${r.scan.new} new, ${r.scan.updated} updated, ${r.scan.unchanged} unchanged`);
+    if (r.embedding) bits.push(`${r.embedding.embedded} added to smart search`);
+    if (r.tagging) bits.push(r.tagging.error ? `tagging stopped: ${r.tagging.error}` : `${r.tagging.tagged} AI-tagged`);
+    if (bits.length) text += ` — ${bits.join(' · ')}`;
+  }
+  if (status) status.textContent = text;
+  if (cancel) cancel.style.display = running ? '' : 'none';
+}
+
+function _pollLibraryJob() {
+  if (_libraryPoll) return;
+  _libraryPoll = setInterval(async () => {
+    let job = null;
+    try {
+      const res = await fetch(`${API_BASE}/api/gallery/sources/job`, { credentials: 'same-origin' });
+      job = res.ok ? (await res.json()).job : null;
+    } catch (_) {}
+    _renderLibraryJob(job);
+    if (!job || job.state !== 'running') {
+      clearInterval(_libraryPoll);
+      _libraryPoll = null;
+      _loadLibrarySources();
+      _fetchFolders();
+      _fetchLibrary(false);
+    }
+  }, 1500);
+}
+
+function _wireLibrarySettings() {
+  const addBtn = document.getElementById('gallery-source-add-btn');
+  addBtn?.addEventListener('click', async () => {
+    const pathEl = document.getElementById('gallery-source-path');
+    const incEl = document.getElementById('gallery-source-include');
+    const path = (pathEl?.value || '').trim();
+    if (!path) { pathEl?.focus(); return; }
+    const include_paths = (incEl?.value || '').split(',').map(x => x.trim()).filter(Boolean);
+    addBtn.disabled = true;
+    try {
+      const res = await fetch(`${API_BASE}/api/gallery/sources`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path, include_paths }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { uiModule.showError(data.detail || 'Could not add the folder'); return; }
+      if (pathEl) pathEl.value = '';
+      if (incEl) incEl.value = '';
+      uiModule.showToast?.(`Added “${data.source.name}” — click Scan to index it`, 4000);
+      _loadLibrarySources();
+    } finally {
+      addBtn.disabled = false;
+    }
+  });
+  document.getElementById('gallery-sources-list')?.addEventListener('click', async (e) => {
+    const row = e.target.closest('.gallery-source-row');
+    if (!row) return;
+    const id = row.dataset.id;
+    const editBtn = e.target.closest('.gallery-source-edit');
+    if (editBtn) {
+      const value = await uiModule.styledPrompt(
+        'Only include these subfolders, separated by commas (e.g. 2005, 2006). Leave empty for the whole folder. Photos already indexed keep their tags.',
+        { title: 'Subfolders', defaultValue: editBtn.dataset.include || '', placeholder: '2005, 2006', maxLength: 1000 },
+      );
+      if (value === null || value === undefined) return;
+      const include_paths = String(value).split(',').map(x => x.trim()).filter(Boolean);
+      const res = await fetch(`${API_BASE}/api/gallery/sources/${encodeURIComponent(id)}`, {
+        method: 'PATCH', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ include_paths }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { uiModule.showError(data.detail || 'Could not save the subfolders'); return; }
+      uiModule.showToast?.('Saved — click Scan now (or wait for auto-sync) to index them', 4000);
+      _loadLibrarySources();
+      return;
+    }
+    if (e.target.closest('.gallery-source-scan')) {
+      const embed = row.querySelector('.gallery-source-opt-embed')?.checked ?? true;
+      const tag = row.querySelector('.gallery-source-opt-tag')?.checked ?? false;
+      const res = await fetch(`${API_BASE}/api/gallery/sources/${encodeURIComponent(id)}/scan`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ embed, tag }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { uiModule.showError(data.detail || 'Could not start the scan'); return; }
+      _renderLibraryJob(data.job);
+      _pollLibraryJob();
+    } else if (e.target.closest('.gallery-source-remove')) {
+      const ok = await uiModule.styledConfirm(
+        'Remove this folder from the gallery? Odysseus forgets its photos, tags and search index. The folder and its photos are not touched.',
+        { confirmText: 'Remove', danger: true },
+      );
+      if (!ok) return;
+      const res = await fetch(`${API_BASE}/api/gallery/sources/${encodeURIComponent(id)}`, { method: 'DELETE', credentials: 'same-origin' });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) { uiModule.showError(data.detail || 'Could not remove the folder'); return; }
+      if (_activeFolder && _activeFolder.source === id) _activeFolder = null;
+      _loadLibrarySources();
+      _fetchFolders();
+      _fetchLibrary(false);
+      _renderAlbums();
+    }
+  });
+  // The Smart search / AI tags choices are saved per folder (used by Scan now
+  // and by the scheduled index task).
+  document.getElementById('gallery-sources-list')?.addEventListener('change', async (e) => {
+    if (!e.target.closest('.gallery-source-opt-embed, .gallery-source-opt-tag')) return;
+    const row = e.target.closest('.gallery-source-row');
+    if (!row) return;
+    const sync = {
+      embed: !!row.querySelector('.gallery-source-opt-embed')?.checked,
+      tag: !!row.querySelector('.gallery-source-opt-tag')?.checked,
+    };
+    const res = await fetch(`${API_BASE}/api/gallery/sources/${encodeURIComponent(row.dataset.id)}`, {
+      method: 'PATCH', credentials: 'same-origin',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ sync }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) { uiModule.showError(data.detail || 'Could not save the sync settings'); return; }
+    _loadLibrarySources();
+  });
+  document.getElementById('gallery-index-task')?.addEventListener('click', async (e) => {
+    const link = e.target.closest('.gallery-index-task-link');
+    if (!link) return;
+    e.preventDefault();
+    try {
+      const m = await import('./tasks.js?v=20260914taskmodel1');
+      m.openTasks(link.dataset.taskId || null, { filter: 'Gallery' });
+    } catch (err) {
+      console.error('Could not open Tasks:', err);
+    }
+  });
+  document.getElementById('gallery-library-job-cancel')?.addEventListener('click', () => {
+    fetch(`${API_BASE}/api/gallery/sources/job/cancel`, { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+  });
+}
+
+async function _loadTagModelPicker() {
+  const row = document.getElementById('gallery-tag-model-row');
+  const sel = document.getElementById('gallery-tag-model');
+  if (!row || !sel) return;
+  try {
+    const [settingsRes, modelsRes] = await Promise.all([
+      fetch(`${API_BASE}/api/auth/settings`, { credentials: 'same-origin' }),
+      fetch(`${API_BASE}/api/models`, { credentials: 'same-origin' }),
+    ]);
+    if (!settingsRes.ok || !modelsRes.ok) { row.style.display = 'none'; return; }
+    const settings = await settingsRes.json();
+    if (!('gallery_tag_model' in settings)) { row.style.display = 'none'; return; }
+    const models = await modelsRes.json();
+    const ids = [];
+    for (const item of (models.items || [])) {
+      if (item.model_type && item.model_type !== 'llm') continue;
+      for (const m of (item.models || [])) if (!ids.includes(m)) ids.push(m);
+    }
+    const current = settings.gallery_tag_model || '';
+    if (current && !ids.includes(current)) ids.unshift(current);
+    sel.innerHTML = '<option value="">Same as the Vision model</option>'
+      + ids.map(m => `<option value="${_esc(m)}"${m === current ? ' selected' : ''}>${_esc(m)}</option>`).join('');
+    row.style.display = '';
+    if (!sel._wired) {
+      sel._wired = true;
+      sel.addEventListener('change', async () => {
+        const res = await fetch(`${API_BASE}/api/auth/settings`, {
+          method: 'POST', credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ gallery_tag_model: sel.value }),
+        });
+        if (!res.ok) uiModule.showError('Could not save the tagging model');
+        else uiModule.showToast?.(sel.value ? `AI tags now use ${sel.value}` : 'AI tags now use the Vision model', 2500);
+      });
+    }
+  } catch (_) {
+    row.style.display = 'none';
+  }
+}
+
+
 function _renderAlbums() {
   const container = document.getElementById('gallery-album-chips');   // above search: active-filter indicators
   const filterC = document.getElementById('gallery-filter-chips');    // below search: All / Favorites
@@ -506,7 +901,8 @@ function _renderAlbums() {
     if (!_activeAlbum) {
       fhtml += `<button class="gallery-chip gallery-chip-fav${_favoritesOnly ? ' active' : ''}" data-fav="true" title="Favorites">&#9829;</button>`;
     }
-    if (_search) fhtml += _filterPill('Search', `Search: ${_search}`, 'data-clear="search"');
+    if (_search) fhtml += _filterPill('Search', `${_smart ? '✨ ' : ''}Search: ${_search}`, 'data-clear="search"');
+    if (_activeFolder) fhtml += _filterPill('Folder', _activeFolder.label || _activeFolder.path, 'data-clear="folder"');
     if (_activeModel) fhtml += _filterPill('Source', _activeModel, 'data-clear="model"');
     _activeTags.forEach(t => {
       fhtml += _filterPill('Tag', `#${t}`, `data-clear-tag="${_esc(t)}"`);
@@ -517,7 +913,7 @@ function _renderAlbums() {
         fhtml += _filterPill('Album', a.name, 'data-clear="album"');
       }
     }
-    if (_search || _activeTags.length || _activeModel || _activeAlbum || _favoritesOnly) {
+    if (_search || _activeTags.length || _activeModel || _activeAlbum || _favoritesOnly || _activeFolder) {
       fhtml += `<button class="gallery-chip gallery-clear-all-filters" data-clear="all" title="Clear every gallery filter">Clear all</button>`;
     }
     filterC.innerHTML = fhtml;
@@ -548,6 +944,10 @@ function _renderAlbums() {
       _fetchLibrary(false);
       _renderAlbums();
     });
+    filterC.querySelector('.gallery-chip-clear[data-clear="folder"]')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _setFolderFilter('');
+    });
     filterC.querySelector('.gallery-chip-clear[data-clear="model"]')?.addEventListener('click', (e) => {
       e.stopPropagation();
       _activeModel = null;
@@ -563,10 +963,13 @@ function _renderAlbums() {
       _activeModel = null;
       _activeAlbum = null;
       _favoritesOnly = false;
+      _activeFolder = null;
       const searchInput = document.getElementById('gallery-search');
       const modelSel = document.getElementById('gallery-model-filter');
+      const folderSel = document.getElementById('gallery-folder-filter');
       if (searchInput) searchInput.value = '';
       if (modelSel) modelSel.value = '';
+      if (folderSel) folderSel.value = '';
       _fetchLibrary(false);
       _renderAlbums();
     });
@@ -1459,7 +1862,7 @@ function _renderGrid() {
              <span class="gallery-card-play" aria-hidden="true">
                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg>
              </span>`
-          : `<img src="${_esc(img.url)}" alt="${_esc(img.prompt)}" loading="lazy" />`}
+          : `<img src="${_esc(img.thumb_url || img.url)}" alt="${_esc(img.prompt)}" loading="lazy" />`}
         <div class="gallery-card-overlay" aria-hidden="true">
           ${badges ? `<span class="gallery-card-badges">${badges}</span>` : ''}
         </div>
@@ -1639,19 +2042,19 @@ function _openDetail(img) {
           <div class="dropdown-divider"></div>
           <button class="dropdown-item-compact dropdown-item-danger" id="gallery-delete-btn">
             <span class="dropdown-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/></svg></span>
-            Delete
+            ${img.read_only ? 'Hide from gallery' : 'Delete'}
           </button>
         </div>
       </div>
     </div>
     <div class="gallery-detail-body">
       <div class="gallery-detail-image" id="gallery-detail-image-wrap" style="position:relative">
-        <button class="gallery-detail-rotate gallery-detail-rotate-ccw" id="gallery-rotate-ccw-btn" title="Rotate 90° counter-clockwise" aria-label="Rotate left">
+        ${img.read_only ? '' : `<button class="gallery-detail-rotate gallery-detail-rotate-ccw" id="gallery-rotate-ccw-btn" title="Rotate 90° counter-clockwise" aria-label="Rotate left">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg>
         </button>
         <button class="gallery-detail-rotate gallery-detail-rotate-cw" id="gallery-rotate-btn" title="Rotate 90° clockwise" aria-label="Rotate right">
           <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-        </button>
+        </button>`}
         <button class="gallery-detail-nav gallery-detail-nav-prev" id="gallery-detail-prev" title="Previous (←)" aria-label="Previous">
           <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="15 18 9 12 15 6"/></svg>
         </button>
@@ -1678,8 +2081,9 @@ function _openDetail(img) {
             <svg class="gallery-name-enter" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>
           </div>
         </div>
+        ${img.read_only ? `<div class="gallery-detail-section"><label>Library</label><div class="gallery-detail-library-path" title="Read-only: the original stays untouched in your folder. Edits are saved as copies.">🔒 ${_esc(img.source_path || '')}</div></div>` : ''}
         ${img.caption ? `<div class="gallery-detail-section"><label>OCR Caption</label><div class="gallery-detail-prompt">${_esc(img.caption)}</div></div>` : ''}
-        ${img.prompt && img.model !== 'imported' ? `<div class="gallery-detail-section gallery-detail-prompt-section"><label>Prompt</label><div class="gallery-detail-prompt">${_esc(img.prompt)}</div><div class="gallery-detail-mini-actions"><button class="gallery-detail-mini-btn" id="gallery-detail-copy-prompt"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Copy</button><button class="gallery-detail-mini-btn" id="gallery-detail-reuse-prompt"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>Reuse in chat</button></div></div>` : ''}
+        ${img.prompt && img.model !== 'imported' && img.model !== 'library' ? `<div class="gallery-detail-section gallery-detail-prompt-section"><label>Prompt</label><div class="gallery-detail-prompt">${_esc(img.prompt)}</div><div class="gallery-detail-mini-actions"><button class="gallery-detail-mini-btn" id="gallery-detail-copy-prompt"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg>Copy</button><button class="gallery-detail-mini-btn" id="gallery-detail-reuse-prompt"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>Reuse in chat</button></div></div>` : ''}
         <div class="gallery-detail-meta-grid">
           <div class="gallery-detail-meta-card"><span>Date</span><strong>${date}</strong></div>
           <div class="gallery-detail-meta-card"><span>Size</span><strong>${dims}${fileSize ? ` · ${fileSize}` : ''}</strong></div>
@@ -2020,7 +2424,8 @@ function _openDetail(img) {
       if (editorContainer) editorContainer.style.display = 'flex';
       const baseFilename = (img.filename || '').replace(/\.[^.]+$/, '');
       const label = img.prompt?.trim() || baseFilename || 'Photo';
-      openEditor(img.url, img.id, null, label);
+      // Library photos are read-only: edit a copy, so Save adds a new gallery image.
+      openEditor(img.url, img.read_only ? null : img.id, null, label);
     } catch (e) {
       console.error('[edit] failed:', e);
       if (uiModule) uiModule.showError('Failed to open editor: ' + (e?.message || 'unknown'));
@@ -2105,7 +2510,10 @@ function _openDetail(img) {
   });
 
   document.getElementById('gallery-delete-btn').addEventListener('click', async () => {
-    if (!await uiModule.styledConfirm('Delete this photo? This cannot be undone.', { confirmText: 'Delete', danger: true })) return;
+    const _confirmText = img.read_only
+      ? 'Hide this photo from the gallery? The original stays untouched in your folder.'
+      : 'Delete this photo? This cannot be undone.';
+    if (!await uiModule.styledConfirm(_confirmText, { confirmText: img.read_only ? 'Hide' : 'Delete', danger: true })) return;
     const ok = await _deleteImage(img.id);
     if (!ok) {
       uiModule.showError('Failed to delete photo');
@@ -2341,16 +2749,20 @@ export function openGallery() {
         <div class="gallery-toolbar">
           <div class="gallery-search-wrap">
             <input type="text" class="gallery-search" id="gallery-search" placeholder="Search photos, tags..." />
+            <button type="button" class="gallery-smart-btn" id="gallery-smart-btn" aria-pressed="false" title="Smart search: find photos by what they show (e.g. “Kinder im Schnee”) instead of by name and tags">✨</button>
             <span class="gallery-search-enter-hint" aria-hidden="true"><svg class="gallery-enter-key" width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 10 4 15 9 20"/><path d="M20 4v7a4 4 0 0 1-4 4H4"/></svg>to tag</span>
           </div>
           <span class="gallery-toolbar-break" aria-hidden="true"></span>
           <select class="gallery-model-filter" id="gallery-model-filter">
             <option value="">All sources</option>
           </select>
+          <select class="gallery-model-filter gallery-folder-filter" id="gallery-folder-filter" title="Library folder" style="display:none"></select>
           <select class="gallery-sort" id="gallery-sort">
             <option value="shuffle"${_sort === 'shuffle' ? ' selected' : ''}>↭ Random order</option>
             <option value="recent"${_sort === 'recent' ? ' selected' : ''}>↓ Newest first</option>
             <option value="oldest"${_sort === 'oldest' ? ' selected' : ''}>↑ Oldest first</option>
+            <option value="taken_desc"${_sort === 'taken_desc' ? ' selected' : ''}>↓ Date taken</option>
+            <option value="taken_asc"${_sort === 'taken_asc' ? ' selected' : ''}>↑ Date taken</option>
           </select>
           <button class="gallery-select-btn gallery-toolbar-action" id="gallery-select-btn" title="Select for bulk actions" style="position:relative;top:0;"><span>Select</span></button>
         </div>
@@ -2370,9 +2782,34 @@ export function openGallery() {
         <div class="gallery-albums-container" id="gallery-albums-container" style="display:none;"></div>
         <div class="gallery-editor-container" id="gallery-editor-container" style="display:none;"></div>
         <div class="gallery-settings-container" id="gallery-settings-container" style="display:none;">
+          <div class="admin-card" id="gallery-library-card" style="display:none;">
+            <h2>Library folders <span id="gallery-library-count" class="memory-count" style="font-size:0.6em;opacity:0.6;font-weight:normal;"></span></h2>
+            <p class="memory-desc doclib-desc">Show photo folders in the gallery where they are. Odysseus only reads them — nothing in these folders is ever changed, moved or deleted. Thumbnails, tags and the smart-search index are kept in Odysseus's own data folder.</p>
+            <div id="gallery-sources-list" class="gallery-sources-list"></div>
+            <div id="gallery-index-task" class="gallery-index-task"></div>
+            <div class="gallery-source-add">
+              <input type="text" id="gallery-source-path" class="gallery-tag-input" placeholder="Folder, e.g. H:\\Pictures\\Privat" />
+              <input type="text" id="gallery-source-include" class="gallery-tag-input" placeholder="Only these subfolders (optional), e.g. 2005, 2006" />
+              <button class="memory-toolbar-btn" id="gallery-source-add-btn">Add folder</button>
+            </div>
+            <div id="gallery-source-hint" class="gallery-source-hint"></div>
+            <div id="gallery-library-job" class="gallery-library-job" style="display:none;">
+              <div style="background:var(--border);border-radius:4px;overflow:hidden;height:6px;">
+                <div id="gallery-library-job-progress" style="height:100%;background:var(--accent, var(--red));width:0%;transition:width 0.3s;"></div>
+              </div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;gap:8px;">
+                <div id="gallery-library-job-status" style="font-size:10px;opacity:0.6;"></div>
+                <button id="gallery-library-job-cancel" class="gallery-select-btn" style="font-size:10px;padding:1px 6px;">Cancel</button>
+              </div>
+            </div>
+          </div>
           <div class="admin-card">
             <h2>AI Tagging <span id="gallery-tag-count" class="memory-count" style="font-size:0.6em;opacity:0.6;font-weight:normal;"></span></h2>
             <p class="memory-desc doclib-desc">Auto-tag photos by content with your <a href="#" id="gallery-vision-link" class="ge-vision-link">vision model</a>. Your own tags are kept.</p>
+            <div class="gallery-tag-model-row" id="gallery-tag-model-row" style="display:none;">
+              <label for="gallery-tag-model">Tagging model</label>
+              <select id="gallery-tag-model"><option value="">Same as the Vision model</option></select>
+            </div>
             <div id="gallery-tag-bar" style="display:none;padding:8px 0 0;">
               <div style="background:var(--border);border-radius:4px;overflow:hidden;height:6px;">
                 <div id="gallery-tag-progress" style="height:100%;background:var(--accent, var(--red));width:0%;transition:width 0.2s;"></div>
@@ -2512,6 +2949,9 @@ export function openGallery() {
         // session is only torn down by the explicit Edit-tab close.
       } else if (target === 'albums') {
         _renderAlbumsTab();
+      } else if (target === 'settings') {
+        _loadLibrarySources();
+        _loadTagModelPicker();
       } else if (target === 'editor') {
         // If the editor isn't already holding an image, render a chooser so the
         // tab does something useful instead of opening an empty grey pane.
@@ -2526,7 +2966,7 @@ export function openGallery() {
     _searchDebounce = setTimeout(() => {
       _search = searchInput.value.trim();
       _fetchLibrary(false);
-    }, 300);
+    }, _smart ? 600 : 300);
   });
   // Pressing Enter in the search box converts the current query into a
   // stacked tag-filter pill (strips a leading "#"), clears the box, and
@@ -2535,6 +2975,14 @@ export function openGallery() {
   searchInput.addEventListener('keydown', (e) => {
     if (e.key !== 'Enter') return;
     e.preventDefault();
+    if (_smart) {
+      // Smart search: Enter runs the search now instead of turning the text into a tag.
+      clearTimeout(_searchDebounce);
+      _search = searchInput.value.trim();
+      _fetchLibrary(false);
+      _renderAlbums();
+      return;
+    }
     const raw = searchInput.value.trim().replace(/^#/, '');
     if (!raw) return;
     if (!_activeTags.includes(raw)) _activeTags.push(raw);
@@ -2567,6 +3015,21 @@ export function openGallery() {
     _activeModel = e.target.value || null;
     _fetchLibrary(false);
   });
+
+  document.getElementById('gallery-folder-filter').addEventListener('change', (e) => {
+    _setFolderFilter(e.target.value);
+  });
+  document.getElementById('gallery-smart-btn').addEventListener('click', () => {
+    _smart = !_smart;
+    _syncSmartButton();
+    // Have the server load its search model while the user types the query.
+    if (_smart) fetch(`${API_BASE}/api/gallery/smart-search/warmup`, { method: 'POST', credentials: 'same-origin' }).catch(() => {});
+    if (_search) _fetchLibrary(false);
+    _renderAlbums();
+    document.getElementById('gallery-search')?.focus();
+  });
+  _syncSmartButton();
+  _wireLibrarySettings();
 
   document.getElementById('gallery-load-more').addEventListener('click', () => {
     _offset = _items.length;
@@ -3252,6 +3715,7 @@ export function openGallery() {
   // 2) Refresh in the background so the cache stays close-to-fresh. If the
   //    fetch fails or takes a moment, the cached view sticks around.
   _fetchAlbums();
+  _fetchFolders();
   _fetchLibrary(false);
   // Desktop keeps the convenient type-to-search behavior. On mobile this
   // immediately opened the keyboard and dropped the user into Search before

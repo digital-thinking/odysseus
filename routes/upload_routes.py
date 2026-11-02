@@ -276,7 +276,8 @@ def setup_upload_routes(upload_handler):
                     GalleryImage.id == gallery_id,
                     GalleryImage.is_active == True,  # noqa: E712
                 ).first()
-                if existing and (not owner or existing.owner == owner):
+                # Library photos stay read-only: never repoint them at a new file.
+                if existing and not existing.source_id and (not owner or existing.owner == owner):
                     image_dir = Path(GENERATED_IMAGES_DIR)
                     image_dir.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(source_path, image_dir / existing.filename)

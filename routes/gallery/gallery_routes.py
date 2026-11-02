@@ -29,8 +29,12 @@ from src.path_confinement import confine
 from src.optional_deps import patch_realesrgan_torchvision_compat
 
 from routes.gallery.gallery_helpers import (
-    GalleryPatch, _extract_exif, _image_to_dict, _owner_filter, _human_size,
+    GalleryPatch, _extract_exif, _image_to_dict, _image_urls, _owner_filter, _human_size,
 )
+from routes.gallery.library_routes import register_library_routes
+from src.gallery_library.files import is_library_image, library_file_path, remove_thumbnail
+
+LIBRARY_READ_ONLY = "Library photos are read-only — the original stays untouched in its folder"
 
 logger = logging.getLogger(__name__)
 
@@ -853,6 +857,14 @@ async def _forward_seneca_image_op(
 
 def setup_gallery_routes() -> APIRouter:
     router = APIRouter(tags=["gallery"])
+    # Library routes first: /api/gallery/sources and /api/gallery/folders must
+    # win over the /api/gallery/{image_id} catch-all below.
+    register_library_routes(router)
+
+    def _image_file(img, db) -> Path:
+        """Original file of any gallery row (library source or generated_images). Read-only use."""
+        lib_path = library_file_path(img, db)
+        return Path(lib_path) if lib_path else _gallery_image_path(img.filename)
 
     # ---- POST /api/gallery/upload ----
     @router.post("/api/gallery/upload")
@@ -948,6 +960,8 @@ def setup_gallery_routes() -> APIRouter:
                 raise HTTPException(404, "Image not found")
             if not user or img.owner != user:
                 raise HTTPException(403, "Not your image")
+            if is_library_image(img):
+                raise HTTPException(409, LIBRARY_READ_ONLY)
 
             form = await request.form()
             file = form.get("image")
@@ -1030,6 +1044,8 @@ def setup_gallery_routes() -> APIRouter:
                 raise HTTPException(404, "Image not found")
             if not user or img.owner != user:
                 raise HTTPException(403, "Not your image")
+            if is_library_image(img):
+                raise HTTPException(409, LIBRARY_READ_ONLY)
 
             img_path = _gallery_image_path(img.filename)
             if not img_path.exists():
@@ -1188,6 +1204,9 @@ def setup_gallery_routes() -> APIRouter:
         seed: Optional[int] = Query(None),
         offset: int = Query(0, ge=0),
         limit: int = Query(24, ge=1, le=100),
+        source: Optional[str] = Query(None),
+        folder: Optional[str] = Query(None),
+        semantic: bool = Query(False),
     ) -> Dict[str, Any]:
         user = get_current_user(request)
         db = SessionLocal()
@@ -1221,10 +1240,21 @@ def setup_gallery_routes() -> APIRouter:
             )
             q = _owner_filter(q, user)
 
+            # Smart search: rank by visual similarity (SigLIP 2 embeddings)
+            # instead of keyword matching; other filters still apply below.
+            ranked_ids = None
+            if semantic and search and search.strip():
+                from src.gallery_library import embeddings as _lib_embeddings
+                try:
+                    hits = await asyncio.to_thread(_lib_embeddings.search, user, search, 200)
+                except _lib_embeddings.SmartSearchUnavailable as exc:
+                    raise HTTPException(503, f"Smart search unavailable: {exc}")
+                ranked_ids = [image_id for image_id, _score in hits]
+                q = q.filter(GalleryImage.id.in_(ranked_ids or [""]))
             # Per-term AND search: a single `%foo bar%` LIKE only matched the
             # exact phrase, so "red car" missed "a car that is red".
             # LIKE wildcards are escaped per token.
-            if search:
+            elif search:
                 from sqlalchemy import or_
                 for tok in search.split():
                     term = f"%{escape_like_pattern(tok)}%"
@@ -1261,6 +1291,14 @@ def setup_gallery_routes() -> APIRouter:
             if favorites:
                 q = q.filter(GalleryImage.favorite == True)
 
+            # Library source / folder filter (folder = relative path prefix)
+            if source:
+                q = q.filter(GalleryImage.source_id == source)
+                folder_path = (folder or "").strip().strip("/")
+                if folder_path:
+                    q = q.filter(GalleryImage.source_relpath.like(
+                        f"{escape_like_pattern(folder_path)}/%", escape="\\"))
+
             # Total before pagination
             total = q.count()
             # How many of those have AI tags — surfaced as "X/Y photos tagged"
@@ -1270,7 +1308,19 @@ def setup_gallery_routes() -> APIRouter:
             ).count()
 
             # Sorting
-            if sort == "shuffle":
+            if ranked_ids is not None:
+                # Keep similarity order across pages.
+                matching = {r[0] for r in q.with_entities(GalleryImage.id).all()}
+                page_ids = [i for i in ranked_ids if i in matching][offset:offset + limit]
+                page_rows = (
+                    db.query(GalleryImage, DbSession.name)
+                    .outerjoin(DbSession, GalleryImage.session_id == DbSession.id)
+                    .filter(GalleryImage.id.in_(page_ids or [""]))
+                    .all()
+                ) if page_ids else []
+                by_id = {img.id: (img, session_name) for img, session_name in page_rows}
+                rows = [by_id[i] for i in page_ids if i in by_id]
+            elif sort == "shuffle":
                 # Seeded shuffle: fetch all matching IDs, shuffle them
                 # deterministically with `seed`, then re-query for just the
                 # page we want. Stable across pagination as long as the
@@ -1294,8 +1344,14 @@ def setup_gallery_routes() -> APIRouter:
                 else:
                     rows = []
             else:
+                from sqlalchemy import func as _func
+                taken = _func.coalesce(GalleryImage.taken_at, GalleryImage.created_at)
                 if sort == "oldest":
                     q = q.order_by(GalleryImage.created_at.asc())
+                elif sort == "taken_desc":
+                    q = q.order_by(taken.desc(), GalleryImage.source_relpath.desc())
+                elif sort == "taken_asc":
+                    q = q.order_by(taken.asc(), GalleryImage.source_relpath.asc())
                 else:  # recent
                     q = q.order_by(GalleryImage.created_at.desc())
                 rows = q.offset(offset).limit(limit).all()
@@ -1310,7 +1366,10 @@ def setup_gallery_routes() -> APIRouter:
                 "total_tagged": total_tagged,
                 "tags": sorted(all_tags),
                 "models": all_models,
+                "semantic": ranked_ids is not None,
             }
+        except HTTPException:
+            raise
         except Exception:
             logger.exception("Failed to fetch gallery library")
             raise HTTPException(500, "Failed to fetch gallery library")
@@ -1339,7 +1398,7 @@ def setup_gallery_routes() -> APIRouter:
                     cover_q = db.query(GalleryImage).filter(GalleryImage.id == a.cover_id)
                     cover = _owner_filter(cover_q, user).first()
                     if cover:
-                        cover_url = f"/api/generated-image/{cover.filename}"
+                        cover_url = _image_urls(cover)[1]
                 elif count > 0:
                     _cover_q = db.query(GalleryImage).filter(
                         GalleryImage.album_id == a.id, GalleryImage.is_active == True
@@ -1347,7 +1406,7 @@ def setup_gallery_routes() -> APIRouter:
                     _cover_q = _owner_filter(_cover_q, user)
                     first = _cover_q.order_by(GalleryImage.created_at.desc()).first()
                     if first:
-                        cover_url = f"/api/generated-image/{first.filename}"
+                        cover_url = _image_urls(first)[1]
                 result.append({
                     "id": a.id, "name": a.name, "description": a.description or "",
                     "cover_url": cover_url, "count": count,
@@ -1527,11 +1586,16 @@ def setup_gallery_routes() -> APIRouter:
             used = set()
             with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
                 for img in imgs:
-                    src = _gallery_image_path(img.filename)
+                    try:
+                        src = _image_file(img, db)  # library originals are only read
+                    except FileNotFoundError:
+                        continue
                     if not src.exists():
                         continue
                     ext = src.suffix or ".png"
                     base = (img.prompt or "").strip() or src.stem
+                    if base.lower().endswith(ext.lower()):
+                        base = base[: -len(ext)]
                     base = re.sub(r"[^\w\-. ]+", "", base)[:60].strip() or img.id
                     name = f"{base}{ext}"
                     i = 1
@@ -1655,22 +1719,35 @@ def setup_gallery_routes() -> APIRouter:
                 raise HTTPException(404, "Image not found")
 
             img_filename = img.filename
+            library_photo = is_library_image(img)
             # Soft-delete the record first; the DB is the source of truth.
             img.is_active = False
+            if library_photo:
+                # Hidden, not deleted: rescans keep it out of the gallery and the
+                # original in the read-only source folder is never touched.
+                img.source_state = "hidden"
             db.commit()
 
-            # Only after the soft-delete commit succeeds do we remove the file.
-            # If the file were deleted first and the commit then failed/rolled
-            # back, the still-active record would point at a missing file.
-            # Best-effort so a missing or locked file can't 500 a delete that
-            # already succeeded logically. Uses the path-confined resolver so a
-            # malformed stored filename can't escape generated_images.
-            try:
-                img_path = _gallery_image_path(img_filename)
-                if img_path.exists():
-                    img_path.unlink()
-            except Exception as e:
-                logger.warning(f"Could not remove gallery image file for {img_filename}: {e}")
+            if library_photo:
+                remove_thumbnail(img.id)
+                try:
+                    from src.gallery_library import embeddings as _lib_embeddings
+                    _lib_embeddings.delete_ids([img.id])
+                except Exception as e:
+                    logger.warning(f"Could not drop search vector for {img.id}: {e}")
+            else:
+                # Only after the soft-delete commit succeeds do we remove the file.
+                # If the file were deleted first and the commit then failed/rolled
+                # back, the still-active record would point at a missing file.
+                # Best-effort so a missing or locked file can't 500 a delete that
+                # already succeeded logically. Uses the path-confined resolver so a
+                # malformed stored filename can't escape generated_images.
+                try:
+                    img_path = _gallery_image_path(img_filename)
+                    if img_path.exists():
+                        img_path.unlink()
+                except Exception as e:
+                    logger.warning(f"Could not remove gallery image file for {img_filename}: {e}")
 
             # Strip stale chat-history references so the image bubble
             # (and its prompt caption) doesn't come back after a server
@@ -3109,101 +3186,34 @@ def setup_gallery_routes() -> APIRouter:
 
     @router.post("/api/gallery/{image_id}/ai-tag")
     async def ai_tag_image(request: Request, image_id: str):
-        """Send image to vision model for auto-tagging."""
-        import base64, httpx
-        from pathlib import Path
+        """Send image to the tagging model (Gallery → Settings → AI Tagging, else Vision)."""
+        from src.gallery_library.files import thumb_path
+        from src.gallery_tagging import TaggingFailed, TaggingUnavailable, request_tags
 
         user = get_current_user(request)
         db = SessionLocal()
         try:
             img = _get_or_404_image(db, image_id, user)
 
-            img_path = _gallery_image_path(img.filename)
+            if is_library_image(img) and os.path.isfile(thumb_path(img.id)):
+                # The 512px thumbnail is plenty for tagging and avoids shipping the original.
+                img_path, mime = Path(thumb_path(img.id)), "image/jpeg"
+            else:
+                try:
+                    img_path = _image_file(img, db)
+                except FileNotFoundError:
+                    raise HTTPException(404, "Image file not found")
+                ext = img.filename.rsplit(".", 1)[-1].lower()
+                mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
+                        "webp": "image/webp", "gif": "image/gif"}.get(ext, "image/jpeg")
             if not img_path.exists():
                 raise HTTPException(404, "Image file not found")
-
-            # Read and encode
             img_bytes = img_path.read_bytes()
-            b64 = base64.b64encode(img_bytes).decode()
-            ext = img.filename.rsplit(".", 1)[-1].lower()
-            mime = {"jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-                    "webp": "image/webp", "gif": "image/gif"}.get(ext, "image/jpeg")
 
-            # Resolve vision model via admin Vision setting (same resolver used for docs)
-            from src.document_processor import _load_vl_settings, _resolve_vl_model
-            vl_settings = _load_vl_settings()
-            if not vl_settings.get("vision_enabled", True):
-                return {"error": "Vision is disabled — enable it in Settings → Vision"}
-            configured = vl_settings.get("vision_model", "")
             try:
-                chat_url, model_name, headers = _resolve_vl_model(configured, owner=user)
-            except ValueError:
-                return {"error": "No vision model configured — set one in Settings → Vision"}
-            if not chat_url:
-                return {"error": "No vision-capable endpoint configured"}
-
-            # Call vision model — format differs between Anthropic and OpenAI
-            from src.llm_core import _detect_provider, _restricts_temperature, _uses_max_completion_tokens
-            provider = _detect_provider(chat_url)
-            tag_prompt = (
-                "Analyze this photo. Return ONLY a comma-separated list of tags. "
-                "Include: objects, people (describe by appearance — age range, gender), "
-                "scene/setting, activities, mood/atmosphere, colors, location type, "
-                "time of day, weather if visible, any text/signs visible. "
-                "Be specific but concise. 10-25 tags. No explanation, just tags."
-            )
-
-            if provider == "anthropic":
-                payload = {
-                    "model": model_name,
-                    "max_tokens": 200,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": "image", "source": {
-                                "type": "base64", "media_type": mime, "data": b64,
-                            }},
-                            {"type": "text", "text": tag_prompt},
-                        ],
-                    }],
-                }
-            else:
-                _tok_key = "max_completion_tokens" if _uses_max_completion_tokens(model_name) else "max_tokens"
-                payload = {
-                    "model": model_name,
-                    "messages": [{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": tag_prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:{mime};base64,{b64}"}},
-                        ],
-                    }],
-                    _tok_key: 200,
-                    "temperature": 0.3,
-                }
-                # Reasoning models (o1/o3/o4/gpt-5) reject an explicit temperature.
-                if _restricts_temperature(model_name):
-                    payload.pop("temperature", None)
-
-            h = {"Content-Type": "application/json"}
-            if headers:
-                h.update(headers)
-
-            async with httpx.AsyncClient(timeout=60) as client:
-                resp = await client.post(chat_url, json=payload, headers=h)
-                if resp.status_code != 200:
-                    logger.error("ai_tag vision model: status %s: %s", resp.status_code, resp.text[:500])
-                    return {"error": "Vision model request failed"}
-                data = resp.json()
-                # Anthropic returns content[0].text, OpenAI returns choices[0].message.content
-                if provider == "anthropic":
-                    content = (data.get("content") or [{}])[0].get("text", "")
-                else:
-                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
-
-            # Clean up tags
-            tags = [t.strip().lower() for t in content.split(",") if t.strip()]
-            tag_str = ", ".join(tags[:30])
+                tag_str = await asyncio.to_thread(request_tags, img_bytes, mime, user)
+            except (TaggingUnavailable, TaggingFailed) as exc:
+                return {"error": str(exc)}
             img.ai_tags = tag_str
             db.commit()
             return {"ok": True, "ai_tags": tag_str}

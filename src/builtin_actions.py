@@ -3676,6 +3676,13 @@ async def action_cookbook_serve(
     return f"Launched {repo_id} (session {sid})", True
 
 
+async def action_index_gallery_library(owner: str, progress_cb=None, **kwargs) -> Tuple[str, bool]:
+    """Index the owner's read-only gallery library folders: new/changed photos get
+    thumbnails, smart-search vectors and (if enabled per folder) AI tags."""
+    from src.gallery_library.sync import run_index_task
+    return await run_index_task(owner, progress_cb=progress_cb)
+
+
 BUILTIN_ACTIONS = {
     "tidy_sessions": action_tidy_sessions,
     "tidy_documents": action_tidy_documents,
@@ -3697,6 +3704,7 @@ BUILTIN_ACTIONS = {
     "audit_skills": action_audit_skills,
     "check_email_urgency": action_check_email_urgency,
     "cookbook_serve": action_cookbook_serve,
+    "index_gallery_library": action_index_gallery_library,
     # ping_notes removed from the registry — runs only inside `_note_pings_loop`.
 }
 
@@ -3718,4 +3726,5 @@ BUILTIN_ACTION_INFO = {
     "test_skills": "Run the per-skill Test on every skill: agent run + LLM judge → records verdict on the skill (pass/needs_work/fail/inconclusive). Advisory only — never rewrites or demotes anything.",
     "audit_skills": "Audit unaudited skills after enough new skills are added: test, narrow metadata, self-edit/retry, optional teacher rewrite, tag duplicates/trivial skills, and publish/draft using the auto-approve threshold.",
     "check_email_urgency": "Scan unread emails hourly, tag urgent/reply-soon/newsletter/marketing/spam, and send a reminder when a new email needs a fast reply.",
+    "index_gallery_library": "Pick up new and changed photos in your gallery library folders (read-only): thumbnails, smart-search index and, where enabled per folder, AI tags.",
 }

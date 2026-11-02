@@ -380,6 +380,29 @@ class GalleryAlbum(TimestampMixin, Base):
     images = relationship("GalleryImage", back_populates="album")
 
 
+class GalleryLibrarySource(TimestampMixin, Base):
+    """An external photo folder indexed in place (read-only).
+
+    Odysseus never writes to ``path``: index rows, thumbnails, tags and
+    embeddings live in Odysseus's own storage. ``path`` is the backend-visible
+    (container) path; ``display_path`` is what the user typed, e.g. a Windows
+    host path that the Docker mount maps to ``path``.
+    """
+    __tablename__ = "gallery_library_sources"
+
+    id              = Column(String, primary_key=True, index=True)
+    owner           = Column(String, nullable=True, index=True)
+    name            = Column(String, nullable=False)
+    path            = Column(Text, nullable=False)
+    display_path    = Column(Text, nullable=True)
+    include_paths   = Column(JSON, nullable=True)   # relative subfolders to scan; empty = whole tree
+    enabled         = Column(Boolean, default=True)
+    last_scan_at    = Column(DateTime, nullable=True)
+    last_scan_stats = Column(JSON, nullable=True)
+    # What the "Gallery Library Index" task does for new photos: {"embed": true, "tag": false}
+    sync_settings   = Column(JSON, nullable=True)
+
+
 class GalleryImage(TimestampMixin, Base):
     """Stores metadata for photos and AI-generated images."""
     __tablename__ = "gallery_images"
@@ -412,6 +435,13 @@ class GalleryImage(TimestampMixin, Base):
     height         = Column(Integer, nullable=True)
     file_size      = Column(Integer, nullable=True)  # bytes
 
+    # Read-only library sources: the original stays in the source folder and is
+    # never modified. NULL source_id = a regular file in generated_images.
+    source_id      = Column(String, nullable=True, index=True)
+    source_relpath = Column(Text, nullable=True)     # POSIX path relative to the source root
+    source_mtime   = Column(Float, nullable=True)    # change detection on rescan
+    source_state   = Column(String, nullable=True)   # ok | missing | hidden
+
     session = relationship("Session", backref=backref("gallery_images"))
     album   = relationship("GalleryAlbum", back_populates="images")
 
@@ -419,6 +449,7 @@ class GalleryImage(TimestampMixin, Base):
         Index('ix_gallery_images_tags', 'tags'),
         Index('ix_gallery_images_model', 'model'),
         Index('ix_gallery_images_active', 'is_active', 'created_at'),
+        Index('ix_gallery_images_source_rel', 'source_id', 'source_relpath', unique=True),
     )
 
 
@@ -1596,6 +1627,49 @@ def _migrate_add_multiuser_owner_columns():
     _migrate_add_owner_to_table("documents", "ix_documents_owner")
 
 
+def _migrate_add_gallery_library_columns():
+    """Add read-only library-source columns (+ unique source/path index) to gallery_images."""
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path)
+        columns = [row[1] for row in conn.execute("PRAGMA table_info(gallery_images)").fetchall()]
+        if not columns:
+            return
+        added = []
+        for name, ddl in (
+            ("source_id", "TEXT"),
+            ("source_relpath", "TEXT"),
+            ("source_mtime", "REAL"),
+            ("source_state", "TEXT"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE gallery_images ADD COLUMN {name} {ddl}")
+                added.append(name)
+        source_columns = [row[1] for row in conn.execute("PRAGMA table_info(gallery_library_sources)").fetchall()]
+        if source_columns and "sync_settings" not in source_columns:
+            conn.execute("ALTER TABLE gallery_library_sources ADD COLUMN sync_settings JSON")
+            added.append("gallery_library_sources.sync_settings")
+        conn.execute("CREATE INDEX IF NOT EXISTS ix_gallery_images_source_id ON gallery_images (source_id)")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS ix_gallery_images_source_rel "
+            "ON gallery_images (source_id, source_relpath)"
+        )
+        conn.commit()
+        if added:
+            logging.getLogger(__name__).info("Migrated: added %s to gallery_images", ", ".join(added))
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Migration gallery library columns failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _migrate_add_gallery_caption_column():
     """Add OCR/vision caption storage for gallery images."""
     import sqlite3
@@ -2435,6 +2509,7 @@ def init_db():
     _migrate_add_mode_column()
     _migrate_add_multiuser_owner_columns()
     _migrate_add_gallery_caption_column()
+    _migrate_add_gallery_library_columns()
     _migrate_add_api_token_scopes_column()
     _migrate_backfill_document_owner_from_session()
     _migrate_assign_legacy_owner()

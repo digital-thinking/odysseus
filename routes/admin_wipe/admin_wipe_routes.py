@@ -28,6 +28,7 @@ from core.database import (
     DocumentVersion,
     GalleryImage,
     GalleryAlbum,
+    GalleryLibrarySource,
     CalendarEvent,
     CalendarCal,
 )
@@ -149,10 +150,21 @@ def setup_admin_wipe_routes(session_manager):
                 count = db.query(GalleryImage).count() + db.query(GalleryAlbum).count()
                 db.query(GalleryImage).delete()
                 db.query(GalleryAlbum).delete()
+                # Library folders: forget the configuration and Odysseus's index
+                # data (thumbnails, vectors). The source folders are never touched.
+                db.query(GalleryLibrarySource).delete()
                 db.commit()
                 # Also drop the upload dir so disk doesn't keep orphans.
                 _rmtree_quiet(GALLERY_DIR)
                 _rmtree_quiet(GALLERY_UPLOADS_DIR)
+                from src.gallery_library.files import LIBRARY_DATA_DIR
+                _rmtree_quiet(LIBRARY_DATA_DIR)
+                try:
+                    from src.chroma_client import get_chroma_client
+                    from src.gallery_library.embeddings import collection_name
+                    get_chroma_client().delete_collection(collection_name())
+                except Exception as e:
+                    logger.info(f"Gallery wipe: no smart-search index to drop ({e})")
                 return {"status": "deleted", "kind": kind, "count": count}
 
             if kind == "calendar":

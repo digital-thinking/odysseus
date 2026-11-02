@@ -68,6 +68,8 @@ _PASSIVE_EXACT_PATHS = {
     "/api/email/urgency-state",
     # UI idle poll sibling of urgency-state; must not pre-empt background tasks.
     "/api/email/unread-state",
+    # Gallery → Settings polls library-index progress while it is open.
+    "/api/gallery/sources/job",
 }
 
 _PASSIVE_PREFIXES = (

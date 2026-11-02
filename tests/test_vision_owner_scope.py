@@ -97,5 +97,9 @@ def test_request_vision_call_sites_pass_owner():
     assert "_process_pdf(path, owner=owner)" in processor_source
     assert "_process_pdf(pdf_path, owner=user)" in document_source
     assert "_resolve_vl_model(vl_model, owner=user)" in document_source
-    assert "_resolve_vl_model(configured, owner=user)" in gallery_source
+    # Gallery AI tagging resolves its model in the shared tagging helper; the
+    # route must hand the caller through so the resolver stays owner-scoped.
+    tagging_source = (ROOT / "src" / "gallery_tagging.py").read_text()
+    assert "_resolve_vl_model(configured, owner=owner)" in tagging_source
+    assert "asyncio.to_thread(request_tags, img_bytes, mime, user)" in gallery_source
     assert "_process_pdf(tmp_path, owner=_owner(request))" in memory_source

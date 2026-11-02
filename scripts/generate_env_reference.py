@@ -343,6 +343,18 @@ def collect(repo_root: Path = REPO_ROOT) -> dict[str, Variable]:
 # own section, rather than hidden.
 VARIABLE_NOTES: dict[str, tuple[str, str, str]] = {
     # -- Deployment and first run ------------------------------------------
+    "ODYSSEUS_GALLERY_LIBRARY_MOUNTS": (
+        "Container and workspace mounts", USER,
+        "Folders the gallery may index read-only as library sources, separated by `;`. "
+        "`host=container` maps a host path (e.g. a Windows drive folder) to its "
+        "read-only Docker mount so users can enter the host path; a bare path is used "
+        "as-is. Empty disables library folders. See docker/gallery-library.yml.",
+    ),
+    "ODYSSEUS_GALLERY_EMBED_MODEL": (
+        "Speech and vision models", USER,
+        "fastembed model for the gallery smart-search index (images and text queries in "
+        "one space). Changing it starts a fresh index; rescan library folders to fill it.",
+    ),
     "ODYSSEUS_ADMIN_USER": (
         "Deployment and first run", USER,
         "Username for the admin account created on first run. Setup uses env vars "

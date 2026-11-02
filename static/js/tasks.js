@@ -465,6 +465,8 @@ const _TASK_ICONS = {
   // Skills
   test_skills:         '<path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/>',
   audit_skills:        '<path d="M9 11l3 3L22 4"/><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v15H6.5A2.5 2.5 0 0 0 4 19.5z"/>',
+  // Gallery
+  index_gallery_library: '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
   // Assistant
   daily_brief:         '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
   // Generic action fallback (gear)
@@ -493,6 +495,7 @@ const _MODEL_BACKED_ACTIONS = new Set([
   'test_skills',
   'audit_skills',
   'consolidate_memory',
+  'index_gallery_library',   // AI tags for new photos (when enabled per folder)
 ]);
 
 function _taskAiMark(task) {
@@ -640,12 +643,13 @@ const _CATEGORY_MAP = {
   run_script:           'System',
   run_local:            'System',
   cookbook_serve:       'Cookbook',
+  index_gallery_library: 'Gallery',
 };
 // Cookbook serves listed FIRST so a just-saved schedule shows at the
 // top instead of scrolling off the bottom of the list. The remaining
 // order is preserved for backwards-compatibility with users who've
 // learned where things are.
-const _CATEGORY_ORDER = ['Cookbook', 'Other', 'Calendar', 'Email', 'Chats', 'Documents', 'Memory', 'Research', 'Skills', 'Assistant', 'System'];
+const _CATEGORY_ORDER = ['Cookbook', 'Other', 'Calendar', 'Email', 'Chats', 'Documents', 'Gallery', 'Memory', 'Research', 'Skills', 'Assistant', 'System'];
 const _CATEGORY_ICONS = {
   Calendar:  '<rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/>',
   Email:     '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-8.97 5.7a1.94 1.94 0 0 1-2.06 0L2 7"/>',
@@ -659,6 +663,7 @@ const _CATEGORY_ICONS = {
   // Cookbook icon — matches the recipe-book glyph used on the sidebar.
   Cookbook:  '<path d="M12 7v14"/><path d="M3 18a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1h5a4 4 0 0 1 4 4 4 4 0 0 1 4-4h5a1 1 0 0 1 1 1v13a1 1 0 0 1-1 1h-6a3 3 0 0 0-3 3 3 3 0 0 0-3-3z"/>',
   Other:     '<circle cx="12" cy="12" r="3"/>',
+  Gallery:   '<rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/>',
 };
 
 function _categoryFor(task) {

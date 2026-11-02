@@ -55,6 +55,9 @@ DEFAULT_SETTINGS = {
     "editor_caption_base_url": "",
     "editor_caption_model": "",
     "vision_model": "",
+    # Model for gallery AI tags (Gallery → Settings → AI Tagging). Empty uses
+    # the Vision model; set it when that one is OCR-only (e.g. glm-ocr).
+    "gallery_tag_model": "",
     "vision_enabled": True,
     # Ordered fallback chain for the Vision model (image analysis, OCR, tagging).
     "vision_model_fallbacks": [],

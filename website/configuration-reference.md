@@ -21,7 +21,7 @@ described as a switch that turns something off, the read rejects `0`, `false`,
 `no` and `off` and treats everything else as on. The `Default` column is the
 value the code falls back to when the variable is unset, quoted from the source.
 
-The source tree reads **149** `ODYSSEUS_*` variables: 92 an operator may want to set, and 57 that are internal - sentinels, fixture switches, capture hooks and development tooling. The internal ones are listed too, in their own section, so this page can be checked against the source mechanically.
+The source tree reads **151** `ODYSSEUS_*` variables: 94 an operator may want to set, and 57 that are internal - sentinels, fixture switches, capture hooks and development tooling. The internal ones are listed too, in their own section, so this page can be checked against the source mechanically.
 
 > This page is generated. Edit `scripts/generate_env_reference.py` and
 > re-run it; `tests/test_env_reference.py` enforces that the committed page
@@ -103,6 +103,7 @@ The source tree reads **149** `ODYSSEUS_*` variables: 92 an operator may want to
 
 | Variable | Default | Read in | What it does |
 |---|---|---|---|
+| `ODYSSEUS_GALLERY_LIBRARY_MOUNTS` | `''` | `src/gallery_library/paths.py` | Folders the gallery may index read-only as library sources, separated by `;`. `host=container` maps a host path (e.g. a Windows drive folder) to its read-only Docker mount so users can enter the host path; a bare path is used as-is. Empty disables library folders. See docker/gallery-library.yml. |
 | `ODYSSEUS_WORKSPACE_CONTAINER_ROOT` | *unset* | `src/workspace_paths.py` | Container-side root that the host root maps onto. An `or` fallback, not a read default, supplies `/workspace` when it is unset. |
 | `ODYSSEUS_WORKSPACE_DEFAULT` | `''` | `routes/workspace_routes.py` | Default workspace path the admin-only workspace route reports. Empty means no default is configured. |
 | `ODYSSEUS_WORKSPACE_HOST_ROOT` | *unset* | `src/workspace_paths.py` | Single host-side root, paired with the container root below. Simpler than the explicit mount list when there is only one mount. |
@@ -172,6 +173,7 @@ The source tree reads **149** `ODYSSEUS_*` variables: 92 an operator may want to
 
 | Variable | Default | Read in | What it does |
 |---|---|---|---|
+| `ODYSSEUS_GALLERY_EMBED_MODEL` | `'google/siglip2-base-patch16-224'` | `src/gallery_library/embeddings.py` | fastembed model for the gallery smart-search index (images and text queries in one space). Changing it starts a fresh index; rescan library folders to fill it. |
 | `ODYSSEUS_GROUNDING_MODEL` | `'google/owlvit-base-patch32'` | `routes/gallery/gallery_routes.py` | Object-grounding model id the gallery loads for text-driven selection. |
 | `ODYSSEUS_SAM_MODEL` | `'facebook/sam-vit-base'` | `routes/gallery/gallery_routes.py` | Segmentation model id the gallery loads for subject selection. |
 | `ODYSSEUS_STT_MODEL` | *unset* | `src/agent_tools/media_tools.py` | Default speech-to-text model for media transcription when the tool call does not name one. |
@@ -302,7 +304,7 @@ reads three ways, because no single pattern covers the codebase:
   lines, so one read lives inside a string literal.
 
 The three passes are not redundancy. A line-based grep for a direct
-`os.environ.get("ODYSSEUS_...` call finds 117 of the 149 variables on this
+`os.environ.get("ODYSSEUS_...` call finds 119 of the 151 variables on this
 page. What it misses is reads through an env-reader helper, reads whose call
 spans more than one line, reads whose variable name is held in a module
 constant, and reads through a mapping passed in as an argument - which is the

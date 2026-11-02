@@ -26,8 +26,12 @@ class GalleryPatch(BaseModel):
 
 # ---- EXIF extraction ----
 
-def _extract_exif(content: bytes) -> dict:
-    """Extract EXIF metadata from image bytes. Returns dict of fields."""
+def _extract_exif(content: bytes, *, with_dimensions: bool = True) -> dict:
+    """Extract EXIF metadata from image bytes. Returns dict of fields.
+
+    ``with_dimensions=False`` skips the EXIF-rotated width/height, which needs
+    a full decode; the library scanner gets those from its thumbnail pass.
+    """
     result = {"width": None, "height": None}
     try:
         from PIL import Image
@@ -40,13 +44,14 @@ def _extract_exif(content: bytes) -> dict:
         # Record DISPLAY dimensions (EXIF-rotated), matching upload_handler.
         # A phone photo with Orientation 6/8 is stored landscape but shown
         # portrait, so the raw width/height swap the aspect ratio.
-        try:
-            from PIL import ImageOps
-            img = ImageOps.exif_transpose(img) or img
-        except Exception:
-            pass
-        result["width"] = img.width
-        result["height"] = img.height
+        if with_dimensions:
+            try:
+                from PIL import ImageOps
+                img = ImageOps.exif_transpose(img) or img
+            except Exception:
+                pass
+            result["width"] = img.width
+            result["height"] = img.height
 
         if not exif:
             return result
@@ -93,11 +98,24 @@ def _extract_exif(content: bytes) -> dict:
 
 # ---- Helpers ----
 
+def _image_urls(img: GalleryImage) -> tuple:
+    """(full-size url, thumbnail url). Library photos are served from their read-only source."""
+    if getattr(img, "source_id", None):
+        return f"/api/gallery/{img.id}/file", f"/api/gallery/{img.id}/thumb"
+    url = f"/api/generated-image/{img.filename}"
+    return url, url
+
+
 def _image_to_dict(img: GalleryImage, session_name: str = None) -> Dict[str, Any]:
+    url, thumb_url = _image_urls(img)
     return {
         "id": img.id,
         "filename": img.filename,
-        "url": f"/api/generated-image/{img.filename}",
+        "url": url,
+        "thumb_url": thumb_url,
+        "read_only": bool(getattr(img, "source_id", None)),
+        "source_id": getattr(img, "source_id", None),
+        "source_path": getattr(img, "source_relpath", None),
         "prompt": img.prompt,
         "caption": img.caption or "",
         "model": img.model,
