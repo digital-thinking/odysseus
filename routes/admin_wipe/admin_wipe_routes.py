@@ -29,6 +29,8 @@ from core.database import (
     GalleryImage,
     GalleryAlbum,
     GalleryLibrarySource,
+    GalleryFace,
+    GalleryPerson,
     CalendarEvent,
     CalendarCal,
 )
@@ -148,6 +150,8 @@ def setup_admin_wipe_routes(session_manager):
 
             if kind == "gallery":
                 count = db.query(GalleryImage).count() + db.query(GalleryAlbum).count()
+                db.query(GalleryFace).delete()
+                db.query(GalleryPerson).delete()
                 db.query(GalleryImage).delete()
                 db.query(GalleryAlbum).delete()
                 # Library folders: forget the configuration and Odysseus's index
@@ -158,7 +162,9 @@ def setup_admin_wipe_routes(session_manager):
                 _rmtree_quiet(GALLERY_DIR)
                 _rmtree_quiet(GALLERY_UPLOADS_DIR)
                 from src.gallery_library.files import LIBRARY_DATA_DIR
+                from src.gallery_faces.index import FACE_DATA_DIR
                 _rmtree_quiet(LIBRARY_DATA_DIR)
+                _rmtree_quiet(FACE_DATA_DIR)
                 try:
                     from src.chroma_client import get_chroma_client
                     from src.gallery_library.embeddings import collection_name

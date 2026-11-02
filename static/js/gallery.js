@@ -219,6 +219,7 @@ async function _fetchLibrary(append) {
   if (_activeModel) params.set('model', _activeModel);
   if (_activeAlbum) params.set('album', _activeAlbum);
   if (_favoritesOnly) params.set('favorites', 'true');
+  if (_activePerson) params.set('person', _activePerson.id);
   if (_activeFolder) {
     params.set('source', _activeFolder.source);
     if (_activeFolder.path) params.set('folder', _activeFolder.path);
@@ -241,7 +242,7 @@ async function _fetchLibrary(append) {
     // Cache an "empty" verdict so the next open of an empty gallery doesn't
     // flash skeleton tiles before the real "No photos yet" message.
     try {
-      const _noFilters = !_search && !_activeTags.length && !_activeModel && !_activeAlbum && !_favoritesOnly && !_activeFolder;
+      const _noFilters = !_search && !_activeTags.length && !_activeModel && !_activeAlbum && !_favoritesOnly && !_activeFolder && !_activePerson;
       if (_noFilters) {
         if (_items.length === 0) localStorage.setItem('gallery-known-empty', '1');
         else localStorage.removeItem('gallery-known-empty');
@@ -674,6 +675,7 @@ async function _loadLibrarySources() {
         <div class="gallery-source-actions">
           <label title="Add new photos to the ✨ smart-search index"><input type="checkbox" class="gallery-source-opt-embed"${src.sync?.embed === false ? '' : ' checked'}> Smart search</label>
           <label title="AI-tag new photos (tagging model below)"><input type="checkbox" class="gallery-source-opt-tag"${src.sync?.tag ? ' checked' : ''}> AI tags</label>
+          <label title="Find faces in new photos and recognise people (People tab)"><input type="checkbox" class="gallery-source-opt-faces"${src.sync?.faces ? ' checked' : ''}> People</label>
           <button class="memory-toolbar-btn gallery-source-edit" data-include="${_esc((src.include_paths || []).join(', '))}" title="Choose which subfolders are included">Subfolders</button>
           <button class="memory-toolbar-btn gallery-source-scan" title="Scan now (only new or changed photos are processed)">Scan now</button>
           <button class="memory-toolbar-btn gallery-source-remove" title="Forget this folder in Odysseus — the photos themselves are not touched">Remove</button>
@@ -698,7 +700,7 @@ function _renderLibraryJob(job) {
   if (bar) bar.style.width = `${pct}%`;
   const phase = {
     starting: 'Starting', listing: 'Listing files', scanning: 'Reading photos and making thumbnails',
-    embedding: 'Building the smart-search index', tagging: 'AI-tagging photos',
+    embedding: 'Building the smart-search index', faces: 'Finding faces', tagging: 'AI-tagging photos',
     done: 'Done', cancelled: 'Cancelled', error: 'Failed',
   }[job.phase] || job.phase;
   let text = running && job.total ? `${phase} — ${job.done}/${job.total}` : phase;
@@ -709,6 +711,7 @@ function _renderLibraryJob(job) {
     const bits = [];
     if (r.scan) bits.push(`${r.scan.new} new, ${r.scan.updated} updated, ${r.scan.unchanged} unchanged`);
     if (r.embedding) bits.push(`${r.embedding.embedded} added to smart search`);
+    if (r.faces) bits.push(`${r.faces.faces} faces found, ${r.faces.matched || 0} recognised, ${r.faces.new_people || 0} new people`);
     if (r.tagging) bits.push(r.tagging.error ? `tagging stopped: ${r.tagging.error}` : `${r.tagging.tagged} AI-tagged`);
     if (bits.length) text += ` — ${bits.join(' · ')}`;
   }
@@ -786,10 +789,11 @@ function _wireLibrarySettings() {
     if (e.target.closest('.gallery-source-scan')) {
       const embed = row.querySelector('.gallery-source-opt-embed')?.checked ?? true;
       const tag = row.querySelector('.gallery-source-opt-tag')?.checked ?? false;
+      const faces = row.querySelector('.gallery-source-opt-faces')?.checked ?? false;
       const res = await fetch(`${API_BASE}/api/gallery/sources/${encodeURIComponent(id)}/scan`, {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ embed, tag }),
+        body: JSON.stringify({ embed, tag, faces }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { uiModule.showError(data.detail || 'Could not start the scan'); return; }
@@ -814,12 +818,13 @@ function _wireLibrarySettings() {
   // The Smart search / AI tags choices are saved per folder (used by Scan now
   // and by the scheduled index task).
   document.getElementById('gallery-sources-list')?.addEventListener('change', async (e) => {
-    if (!e.target.closest('.gallery-source-opt-embed, .gallery-source-opt-tag')) return;
+    if (!e.target.closest('.gallery-source-opt-embed, .gallery-source-opt-tag, .gallery-source-opt-faces')) return;
     const row = e.target.closest('.gallery-source-row');
     if (!row) return;
     const sync = {
       embed: !!row.querySelector('.gallery-source-opt-embed')?.checked,
       tag: !!row.querySelector('.gallery-source-opt-tag')?.checked,
+      faces: !!row.querySelector('.gallery-source-opt-faces')?.checked,
     };
     const res = await fetch(`${API_BASE}/api/gallery/sources/${encodeURIComponent(row.dataset.id)}`, {
       method: 'PATCH', credentials: 'same-origin',
@@ -887,6 +892,248 @@ async function _loadTagModelPicker() {
 }
 
 
+// ---- People (recognised faces) ----
+
+let _activePerson = null;      // { id, name } — Photos filter
+let _peopleView = null;        // null = all people, { type: 'person', id } or { type: 'unknown' }
+let _faceOverlayCleanup = null;
+
+async function _jsonFetch(url, opts = {}) {
+  const res = await fetch(`${API_BASE}${url}`, { credentials: 'same-origin', ...opts });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.detail || data.error || `HTTP ${res.status}`);
+  return data;
+}
+
+function _postJson(url, body, method = 'POST') {
+  return _jsonFetch(url, { method, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+}
+
+// Ask for a name and assign it to one face. Similar faces join automatically.
+async function _nameFace(faceId, current) {
+  const name = await uiModule.styledPrompt(
+    'Who is this? Photos with the same person are recognised automatically.',
+    { title: 'Name this person', defaultValue: current || '', placeholder: 'Name', maxLength: 80 },
+  );
+  if (!name || !String(name).trim()) return null;
+  try {
+    const data = await _postJson(`/api/gallery/faces/${encodeURIComponent(faceId)}`, { name: String(name).trim() });
+    const more = data.regrouped?.matched || 0;
+    uiModule.showToast?.(more ? `${String(name).trim()} — ${more} more face${more === 1 ? '' : 's'} recognised` : `Saved: ${String(name).trim()}`, 3500);
+    return data;
+  } catch (e) {
+    uiModule.showError(e.message || 'Could not save the name');
+    return null;
+  }
+}
+
+function _setPersonFilter(person) {
+  _activePerson = person;
+  const modal = document.getElementById('gallery-modal');
+  modal?.querySelector('.gallery-tab[data-tab="images"]')?.click();
+  _fetchLibrary(false);
+  _renderAlbums();
+}
+
+// Face boxes + "People in this photo" in the photo detail view.
+async function _loadDetailFaces(img) {
+  if (_faceOverlayCleanup) { _faceOverlayCleanup(); _faceOverlayCleanup = null; }
+  const section = document.getElementById('gallery-detail-people-section');
+  const list = document.getElementById('gallery-detail-people-list');
+  const overlay = document.getElementById('gallery-detail-face-overlay');
+  const imgEl = document.getElementById('gallery-detail-img');
+  if (!overlay || !imgEl || imgEl.tagName !== 'IMG') return;
+  let faces = [];
+  try {
+    faces = (await _jsonFetch(`/api/gallery/${encodeURIComponent(img.id)}/faces`)).faces || [];
+  } catch (_) {
+    faces = [];
+  }
+  if (document.getElementById('gallery-detail-img') !== imgEl) return;  // user moved on
+  if (!faces.length) {
+    if (section) section.style.display = 'none';
+    overlay.innerHTML = '';
+    return;
+  }
+  if (section && list) {
+    section.style.display = '';
+    list.innerHTML = faces.map(f => (f.person_name
+      ? `<button class="gallery-ai-chip gallery-person-chip" data-person-id="${_esc(f.person_id)}" data-person-name="${_esc(f.person_name)}" title="All photos of ${_esc(f.person_name)}">${_esc(f.person_name)}</button>`
+      : `<button class="gallery-ai-chip gallery-person-chip unknown" data-face-id="${_esc(f.id)}" title="Name this face">? Who is this</button>`)).join('');
+    list.onclick = async (e) => {
+      const chip = e.target.closest('.gallery-person-chip');
+      if (!chip) return;
+      if (chip.dataset.personId) {
+        _setPersonFilter({ id: chip.dataset.personId, name: chip.dataset.personName });
+      } else if (await _nameFace(chip.dataset.faceId, '')) {
+        _loadDetailFaces(img);
+      }
+    };
+  }
+  const place = () => {
+    const frame = overlay.parentElement;
+    if (!frame || !imgEl.naturalWidth) return;
+    const fr = frame.getBoundingClientRect();
+    const ir = imgEl.getBoundingClientRect();
+    const scale = Math.min(ir.width / imgEl.naturalWidth, ir.height / imgEl.naturalHeight);
+    const dw = imgEl.naturalWidth * scale;
+    const dh = imgEl.naturalHeight * scale;
+    const left = ir.left - fr.left + (ir.width - dw) / 2;
+    const top = ir.top - fr.top + (ir.height - dh) / 2;
+    overlay.innerHTML = faces.map(f => `
+      <div class="gallery-face-box${f.person_name ? '' : ' unknown'}" data-face-id="${_esc(f.id)}" data-name="${_esc(f.person_name || '')}"
+           style="left:${left + f.box.x * dw}px;top:${top + f.box.y * dh}px;width:${f.box.w * dw}px;height:${f.box.h * dh}px"
+           title="${f.person_name ? `${_esc(f.person_name)} — click to change` : 'Click to name this person'}">
+        <span>${_esc(f.person_name || '?')}</span>
+      </div>`).join('');
+  };
+  overlay.onclick = async (e) => {
+    const box = e.target.closest('.gallery-face-box');
+    if (box && await _nameFace(box.dataset.faceId, box.dataset.name)) _loadDetailFaces(img);
+  };
+  if (imgEl.complete) place(); else imgEl.addEventListener('load', place, { once: true });
+  window.addEventListener('resize', place);
+  _faceOverlayCleanup = () => window.removeEventListener('resize', place);
+}
+
+async function _renderPeopleTab() {
+  const c = document.getElementById('gallery-people-container');
+  if (!c) return;
+  if (_peopleView?.type === 'person') return _renderPersonView(c, _peopleView.id);
+  if (_peopleView?.type === 'unknown') return _renderUnknownFaces(c);
+  let data;
+  try {
+    data = await _jsonFetch('/api/gallery/people');
+  } catch (e) {
+    c.innerHTML = `<div class="gallery-people-empty">${_esc(e.message)}</div>`;
+    return;
+  }
+  const people = data.people || [];
+  if (!people.length && !data.unknown_faces) {
+    c.innerHTML = '<div class="gallery-people-empty">No faces found yet. In <strong>Settings → Library folders</strong>, tick <strong>People</strong> for a folder and click Scan now.</div>';
+    return;
+  }
+  const named = people.filter(p => p.name).length;
+  c.innerHTML = `
+    <div class="gallery-people-head">
+      <span class="gallery-people-summary">${named} named · ${people.length - named} not named yet</span>
+      ${data.unknown_faces ? `<button class="memory-toolbar-btn" id="gallery-people-unknown">Unknown faces (${data.unknown_faces})</button>` : ''}
+    </div>
+    <div class="gallery-people-grid">${people.map(p => `
+      <div class="gallery-person-card" data-id="${_esc(p.id)}" title="${p.name ? _esc(p.name) : 'Click to name'}">
+        <img src="${_esc(p.cover_url || '')}" alt="" loading="lazy" />
+        <div class="gallery-person-name">${p.name ? _esc(p.name) : '<span class="unnamed">Add a name</span>'}</div>
+        <div class="gallery-person-count">${p.photo_count} photo${p.photo_count === 1 ? '' : 's'}</div>
+      </div>`).join('')}
+    </div>`;
+  c.querySelector('#gallery-people-unknown')?.addEventListener('click', () => { _peopleView = { type: 'unknown' }; _renderPeopleTab(); });
+  c.querySelectorAll('.gallery-person-card').forEach(card => card.addEventListener('click', () => {
+    _peopleView = { type: 'person', id: card.dataset.id };
+    _renderPeopleTab();
+  }));
+}
+
+async function _renderPersonView(c, personId) {
+  let data;
+  try {
+    data = await _jsonFetch(`/api/gallery/people/${encodeURIComponent(personId)}/faces?limit=400`);
+  } catch (_) {
+    _peopleView = null;
+    return _renderPeopleTab();
+  }
+  const p = data.person;
+  const label = p.name || 'this person';
+  c.innerHTML = `
+    <div class="gallery-people-head">
+      <button class="gallery-detail-back" id="gallery-people-back">&larr; People</button>
+      <input class="gallery-tag-input gallery-person-name-input" id="gallery-person-name" value="${_esc(p.name || '')}" placeholder="Who is this? (Enter to save)" />
+      <button class="memory-toolbar-btn" id="gallery-person-photos">Show photos</button>
+      <button class="memory-toolbar-btn" id="gallery-person-forget" title="Forget this person — the faces go back to Unknown faces">Forget</button>
+    </div>
+    <div class="gallery-people-hint">Click × on any face that is not ${_esc(label)}. Giving two people the same name merges them.</div>
+    <div class="gallery-faces-grid">${data.faces.map(f => `
+      <div class="gallery-face-tile" data-face-id="${_esc(f.id)}" data-image-id="${_esc(f.image_id)}" title="Open the photo">
+        <img src="${_esc(f.crop_url)}" alt="" loading="lazy" />
+        <button class="gallery-face-remove" title="Not ${_esc(label)}">×</button>
+        ${f.assigned === 'user' ? '' : '<span class="gallery-face-auto" title="Recognised automatically">auto</span>'}
+      </div>`).join('')}
+    </div>`;
+  c.querySelector('#gallery-people-back').addEventListener('click', () => { _peopleView = null; _renderPeopleTab(); });
+  const input = c.querySelector('#gallery-person-name');
+  input.addEventListener('keydown', async (e) => {
+    if (e.key !== 'Enter' || !input.value.trim()) return;
+    e.preventDefault();
+    try {
+      const res = await _postJson(`/api/gallery/people/${encodeURIComponent(p.id)}`, { name: input.value.trim() }, 'PATCH');
+      const more = res.regrouped?.matched || 0;
+      uiModule.showToast?.(res.merged_into ? `Merged into ${res.person.name}` : `Saved: ${res.person.name}${more ? ` — ${more} more faces recognised` : ''}`, 3500);
+      _peopleView = { type: 'person', id: res.person.id };
+      _renderPeopleTab();
+    } catch (err) {
+      uiModule.showError(err.message);
+    }
+  });
+  c.querySelector('#gallery-person-photos').addEventListener('click', () => _setPersonFilter({ id: p.id, name: p.name || 'Unnamed person' }));
+  c.querySelector('#gallery-person-forget').addEventListener('click', async () => {
+    const ok = await uiModule.styledConfirm(`Forget ${label}? The faces go back to Unknown faces. Photos are not changed.`, { confirmText: 'Forget', danger: true });
+    if (!ok) return;
+    try {
+      await _jsonFetch(`/api/gallery/people/${encodeURIComponent(p.id)}`, { method: 'DELETE' });
+      _peopleView = null;
+      _renderPeopleTab();
+    } catch (err) {
+      uiModule.showError(err.message);
+    }
+  });
+  c.querySelector('.gallery-faces-grid').addEventListener('click', async (e) => {
+    const tile = e.target.closest('.gallery-face-tile');
+    if (!tile) return;
+    if (e.target.closest('.gallery-face-remove')) {
+      try {
+        await _postJson(`/api/gallery/faces/${encodeURIComponent(tile.dataset.faceId)}`, { person_id: null });
+        tile.remove();
+      } catch (err) {
+        uiModule.showError(err.message);
+      }
+      return;
+    }
+    openGalleryImage(tile.dataset.imageId);
+  });
+}
+
+async function _renderUnknownFaces(c) {
+  let faces = [];
+  try {
+    faces = (await _jsonFetch('/api/gallery/faces/unknown?limit=400')).faces || [];
+  } catch (_) {}
+  c.innerHTML = `
+    <div class="gallery-people-head">
+      <button class="gallery-detail-back" id="gallery-people-back">&larr; People</button>
+      <span class="gallery-people-summary">${faces.length} faces not recognised yet — click one to name it</span>
+    </div>
+    <div class="gallery-faces-grid">${faces.map(f => `
+      <div class="gallery-face-tile" data-face-id="${_esc(f.id)}" title="Name this face">
+        <img src="${_esc(f.crop_url)}" alt="" loading="lazy" />
+        <button class="gallery-face-remove" title="Not a face">×</button>
+      </div>`).join('')}
+    </div>`;
+  c.querySelector('#gallery-people-back').addEventListener('click', () => { _peopleView = null; _renderPeopleTab(); });
+  c.querySelector('.gallery-faces-grid').addEventListener('click', async (e) => {
+    const tile = e.target.closest('.gallery-face-tile');
+    if (!tile) return;
+    if (e.target.closest('.gallery-face-remove')) {
+      try {
+        await _postJson(`/api/gallery/faces/${encodeURIComponent(tile.dataset.faceId)}`, { ignored: true });
+        tile.remove();
+      } catch (err) {
+        uiModule.showError(err.message);
+      }
+      return;
+    }
+    if (await _nameFace(tile.dataset.faceId, '')) _renderUnknownFaces(c);
+  });
+}
+
 function _renderAlbums() {
   const container = document.getElementById('gallery-album-chips');   // above search: active-filter indicators
   const filterC = document.getElementById('gallery-filter-chips');    // below search: All / Favorites
@@ -903,6 +1150,7 @@ function _renderAlbums() {
     }
     if (_search) fhtml += _filterPill('Search', `${_smart ? '✨ ' : ''}Search: ${_search}`, 'data-clear="search"');
     if (_activeFolder) fhtml += _filterPill('Folder', _activeFolder.label || _activeFolder.path, 'data-clear="folder"');
+    if (_activePerson) fhtml += _filterPill('Person', _activePerson.name, 'data-clear="person"');
     if (_activeModel) fhtml += _filterPill('Source', _activeModel, 'data-clear="model"');
     _activeTags.forEach(t => {
       fhtml += _filterPill('Tag', `#${t}`, `data-clear-tag="${_esc(t)}"`);
@@ -913,7 +1161,7 @@ function _renderAlbums() {
         fhtml += _filterPill('Album', a.name, 'data-clear="album"');
       }
     }
-    if (_search || _activeTags.length || _activeModel || _activeAlbum || _favoritesOnly || _activeFolder) {
+    if (_search || _activeTags.length || _activeModel || _activeAlbum || _favoritesOnly || _activeFolder || _activePerson) {
       fhtml += `<button class="gallery-chip gallery-clear-all-filters" data-clear="all" title="Clear every gallery filter">Clear all</button>`;
     }
     filterC.innerHTML = fhtml;
@@ -944,6 +1192,12 @@ function _renderAlbums() {
       _fetchLibrary(false);
       _renderAlbums();
     });
+    filterC.querySelector('.gallery-chip-clear[data-clear="person"]')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _activePerson = null;
+      _fetchLibrary(false);
+      _renderAlbums();
+    });
     filterC.querySelector('.gallery-chip-clear[data-clear="folder"]')?.addEventListener('click', (e) => {
       e.stopPropagation();
       _setFolderFilter('');
@@ -964,6 +1218,7 @@ function _renderAlbums() {
       _activeAlbum = null;
       _favoritesOnly = false;
       _activeFolder = null;
+      _activePerson = null;
       const searchInput = document.getElementById('gallery-search');
       const modelSel = document.getElementById('gallery-model-filter');
       const folderSel = document.getElementById('gallery-folder-filter');
@@ -1963,6 +2218,8 @@ function _openDetail(img) {
   if (!detail) return;
   // Drop any face-overlay resize listener from the previous photo
   // before the new render attaches its own.
+  if (_faceOverlayCleanup) { _faceOverlayCleanup(); _faceOverlayCleanup = null; }
+  setTimeout(() => _loadDetailFaces(img), 0);
 
   const _dateSrc = img.taken_at || img.created_at || null;
   const _dateObj = _dateSrc ? new Date(_dateSrc) : null;
@@ -1994,7 +2251,9 @@ function _openDetail(img) {
   // created_at (>10s). Every photo bumps updated_at on insert via the
   // ORM timestamp mixin, so the gap filters out the trivial case.
   let editedHtml = '';
-  if (img.updated_at && img.created_at) {
+  // Library photos are never edited: their row only changes when Odysseus
+  // adds tags/faces, which must not read as "Edited".
+  if (img.updated_at && img.created_at && !img.read_only) {
     const u = new Date(img.updated_at);
     const c = new Date(img.created_at);
     if (!isNaN(u) && !isNaN(c) && (u.getTime() - c.getTime() > 10000)) {
@@ -2420,6 +2679,8 @@ function _openDetail(img) {
       const albumsContainer = document.getElementById('gallery-albums-container');
       if (imagesContainer) imagesContainer.style.display = 'none';
       if (albumsContainer) albumsContainer.style.display = 'none';
+      const _peopleC = document.getElementById('gallery-people-container');
+      if (_peopleC) _peopleC.style.display = 'none';
       const editorContainer = document.getElementById('gallery-editor-container');
       if (editorContainer) editorContainer.style.display = 'flex';
       const baseFilename = (img.filename || '').replace(/\.[^.]+$/, '');
@@ -2721,6 +2982,10 @@ export function openGallery() {
           <span class="gallery-tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg></span>
           <span class="gallery-tab-label">Photos</span>
         </button>
+        <button class="gallery-tab" data-tab="people">
+          <span class="gallery-tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="9" cy="8" r="4"/><path d="M2 21v-1a6 6 0 0 1 6-6h2a6 6 0 0 1 6 6v1"/><path d="M16 4a4 4 0 0 1 0 8"/><path d="M22 21v-1a6 6 0 0 0-4-5.6"/></svg></span>
+          <span class="gallery-tab-label">People</span>
+        </button>
         <button class="gallery-tab" data-tab="albums">
           <span class="gallery-tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>
           <span class="gallery-tab-label">Albums</span>
@@ -2780,6 +3045,7 @@ export function openGallery() {
         <div class="gallery-detail" id="gallery-detail" style="display:none"></div>
         </div>
         <div class="gallery-albums-container" id="gallery-albums-container" style="display:none;"></div>
+        <div class="gallery-people-container" id="gallery-people-container" style="display:none;"></div>
         <div class="gallery-editor-container" id="gallery-editor-container" style="display:none;"></div>
         <div class="gallery-settings-container" id="gallery-settings-container" style="display:none;">
           <div class="admin-card" id="gallery-library-card" style="display:none;">
@@ -2942,6 +3208,8 @@ export function openGallery() {
       const settingsContainer = document.getElementById('gallery-settings-container');
       if (imagesContainer) imagesContainer.style.display = target === 'images' ? '' : 'none';
       if (albumsContainer) albumsContainer.style.display = target === 'albums' ? '' : 'none';
+      const peopleContainer = document.getElementById('gallery-people-container');
+      if (peopleContainer) peopleContainer.style.display = target === 'people' ? '' : 'none';
       if (editorContainer) editorContainer.style.display = target === 'editor' ? 'flex' : 'none';
       if (settingsContainer) settingsContainer.style.display = target === 'settings' ? '' : 'none';
       if (target === 'images') {
@@ -2949,6 +3217,9 @@ export function openGallery() {
         // session is only torn down by the explicit Edit-tab close.
       } else if (target === 'albums') {
         _renderAlbumsTab();
+      } else if (target === 'people') {
+        _peopleView = null;
+        _renderPeopleTab();
       } else if (target === 'settings') {
         _loadLibrarySources();
         _loadTagModelPicker();
@@ -3736,6 +4007,8 @@ function _showImagesTab() {
   if (albumsContainer) albumsContainer.style.display = 'none';
   if (editorContainer) editorContainer.style.display = 'none';
   if (settingsContainer) settingsContainer.style.display = 'none';
+  const peopleContainer = document.getElementById('gallery-people-container');
+  if (peopleContainer) peopleContainer.style.display = 'none';
 }
 
 export async function openGalleryImage(imageId) {

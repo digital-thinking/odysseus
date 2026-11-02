@@ -507,13 +507,13 @@ def test_adding_a_subfolder_keeps_existing_photos_and_tags(lib):
 def test_scan_choices_are_remembered_for_the_index_task(lib, fake_index):
     client = lib["client"]
     source = _add_source(lib, path=HOST_ROOT, include_paths=["2005"]).json()["source"]
-    assert source["sync"] == {"embed": True, "tag": False}
+    assert source["sync"] == {"embed": True, "tag": False, "faces": False}
     patched = client.patch(f"/api/gallery/sources/{source['id']}", json={"sync": {"tag": True, "interval_minutes": 5}})
-    assert patched.json()["source"]["sync"] == {"embed": True, "tag": True}   # unknown keys dropped
+    assert patched.json()["source"]["sync"] == {"embed": True, "tag": True, "faces": False}   # unknown keys dropped
     client.post(f"/api/gallery/sources/{source['id']}/scan", json={"embed": False, "tag": True})
     _wait_for_job()
     listed = client.get("/api/gallery/sources").json()
-    assert listed["sources"][0]["sync"] == {"embed": False, "tag": True}
+    assert listed["sources"][0]["sync"] == {"embed": False, "tag": True, "faces": False}
     assert listed["index_task"] is None   # no scheduled task seeded in this test
 
 

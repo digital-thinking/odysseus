@@ -46,7 +46,7 @@ def cancel() -> bool:
     return True
 
 
-def _claim(source_id: str, embed: bool, tag: bool, trigger: str) -> Optional[dict]:
+def _claim(source_id: str, embed: bool, tag: bool, trigger: str, faces: bool = False) -> Optional[dict]:
     """Register a new running job, or return None if one is already running."""
     global _job
     with _lock:
@@ -60,7 +60,7 @@ def _claim(source_id: str, embed: bool, tag: bool, trigger: str) -> Optional[dic
             "phase": "starting",
             "done": 0,
             "total": 0,
-            "options": {"embed": bool(embed), "tag": bool(tag)},
+            "options": {"embed": bool(embed), "tag": bool(tag), "faces": bool(faces)},
             "trigger": trigger,  # manual | task
             "started_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
             "finished_at": None,
@@ -70,28 +70,29 @@ def _claim(source_id: str, embed: bool, tag: bool, trigger: str) -> Optional[dic
         return dict(_job)
 
 
-def start(source_id: str, *, embed: bool = True, tag: bool = False, trigger: str = "manual") -> dict:
+def start(source_id: str, *, embed: bool = True, tag: bool = False, faces: bool = False,
+          trigger: str = "manual") -> dict:
     """Start a job in a background thread (the Scan now button)."""
-    job = _claim(source_id, embed, tag, trigger)
+    job = _claim(source_id, embed, tag, trigger, faces)
     if job is None:
         raise JobAlreadyRunning("An indexing job is already running")
-    threading.Thread(target=_run, args=(source_id, bool(embed), bool(tag)), daemon=True,
+    threading.Thread(target=_run, args=(source_id, bool(embed), bool(tag), bool(faces)), daemon=True,
                      name="gallery-library-index").start()
     return job
 
 
-def run_now(source_id: str, *, embed: bool = True, tag: bool = False, trigger: str = "task",
+def run_now(source_id: str, *, embed: bool = True, tag: bool = False, faces: bool = False, trigger: str = "task",
             wait_seconds: float = 6 * 3600) -> dict:
     """Run a job in the calling thread (the scheduled task) and return its final status.
 
     If a manual scan is running, waits for it first instead of failing.
     """
     deadline = time.monotonic() + wait_seconds
-    while _claim(source_id, embed, tag, trigger) is None:
+    while _claim(source_id, embed, tag, trigger, faces) is None:
         if time.monotonic() > deadline:
             raise JobAlreadyRunning("Another indexing job kept running")
         time.sleep(5)
-    _run(source_id, bool(embed), bool(tag))
+    _run(source_id, bool(embed), bool(tag), bool(faces))
     return status() or {}
 
 
@@ -105,7 +106,7 @@ def _progress(phase: str, done: int, total: int) -> None:
     _update(phase=phase, done=done, total=total)
 
 
-def _run(source_id: str, embed: bool, tag: bool) -> None:
+def _run(source_id: str, embed: bool, tag: bool, faces: bool = False) -> None:
     from src.gallery_library.scanner import scan_source
 
     result: dict = {}
@@ -119,6 +120,8 @@ def _run(source_id: str, embed: bool, tag: bool) -> None:
             embeddings.delete_ids(scan["changed_ids"])
         if embed and not _cancel.is_set():
             result["embedding"] = _embed_source(source_id)
+        if faces and not _cancel.is_set():
+            result["faces"] = _faces_source(source_id)
         if tag and not _cancel.is_set():
             result["tagging"] = _tag_source(source_id)
         state = "cancelled" if _cancel.is_set() else "done"
@@ -129,6 +132,26 @@ def _run(source_id: str, embed: bool, tag: bool) -> None:
     finally:
         _update(finished_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
         _store_job_result(source_id, result)
+
+
+def _faces_source(source_id: str) -> dict:
+    """Find faces in new photos, then (re)group faces into people."""
+    from core.database import GalleryLibrarySource, SessionLocal
+    from src.gallery_faces.index import cluster_faces, scan_faces
+
+    started = time.time()
+    _progress("faces", 0, 0)
+    stats = scan_faces(source_id, progress=lambda d, t: _progress("faces", d, t), cancel=_cancel)
+    db = SessionLocal()
+    try:
+        source = db.query(GalleryLibrarySource).filter(GalleryLibrarySource.id == source_id).first()
+        owner = source.owner if source else None
+    finally:
+        db.close()
+    if not _cancel.is_set():
+        stats.update(cluster_faces(owner))
+    stats["seconds"] = round(time.time() - started, 1)
+    return stats
 
 
 def _active_rows(db, source_id: str):
@@ -227,7 +250,7 @@ def _store_job_result(source_id: str, result: dict) -> None:
         if source is None:
             return
         stats = dict(source.last_scan_stats or {})
-        for key in ("embedding", "tagging"):
+        for key in ("embedding", "faces", "tagging"):
             if key in result:
                 stats[key] = result[key]
         source.last_scan_stats = stats

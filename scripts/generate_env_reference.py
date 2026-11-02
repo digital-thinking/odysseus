@@ -350,6 +350,16 @@ VARIABLE_NOTES: dict[str, tuple[str, str, str]] = {
         "read-only Docker mount so users can enter the host path; a bare path is used "
         "as-is. Empty disables library folders. See docker/gallery-library.yml.",
     ),
+    "ODYSSEUS_GALLERY_FACE_MODEL": (
+        "Speech and vision models", USER,
+        "InsightFace model pack for recognising people in gallery photos: antelopev2 "
+        "(most accurate) or buffalo_l (faster). Downloaded once from Hugging Face. "
+        "Changing it rescans faces on the next library index run.",
+    ),
+    "ODYSSEUS_GALLERY_FACE_THREADS": (
+        "Speech and vision models", USER,
+        "CPU threads for face detection and recognition (onnxruntime). Empty uses all cores.",
+    ),
     "ODYSSEUS_GALLERY_EMBED_MODEL": (
         "Speech and vision models", USER,
         "fastembed model for the gallery smart-search index (images and text queries in "

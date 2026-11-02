@@ -15,7 +15,7 @@ from typing import Dict, Any, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
 
-from core.database import SessionLocal, GalleryImage, GalleryAlbum, ModelEndpoint
+from core.database import SessionLocal, GalleryImage, GalleryAlbum, ModelEndpoint, GalleryFace, GalleryPerson
 from core.database import Session as DbSession
 from src.auth_helpers import get_current_user, owner_filter, require_privilege
 from src.session_search import escape_like_pattern
@@ -32,6 +32,7 @@ from routes.gallery.gallery_helpers import (
     GalleryPatch, _extract_exif, _image_to_dict, _image_urls, _owner_filter, _human_size,
 )
 from routes.gallery.library_routes import register_library_routes
+from routes.gallery.people_routes import register_people_routes
 from src.gallery_library.files import is_library_image, library_file_path, remove_thumbnail
 
 LIBRARY_READ_ONLY = "Library photos are read-only — the original stays untouched in its folder"
@@ -860,6 +861,7 @@ def setup_gallery_routes() -> APIRouter:
     # Library routes first: /api/gallery/sources and /api/gallery/folders must
     # win over the /api/gallery/{image_id} catch-all below.
     register_library_routes(router)
+    register_people_routes(router)
 
     def _image_file(img, db) -> Path:
         """Original file of any gallery row (library source or generated_images). Read-only use."""
@@ -1207,6 +1209,7 @@ def setup_gallery_routes() -> APIRouter:
         source: Optional[str] = Query(None),
         folder: Optional[str] = Query(None),
         semantic: bool = Query(False),
+        person: Optional[str] = Query(None),
     ) -> Dict[str, Any]:
         user = get_current_user(request)
         db = SessionLocal()
@@ -1258,10 +1261,14 @@ def setup_gallery_routes() -> APIRouter:
                 from sqlalchemy import or_
                 for tok in search.split():
                     term = f"%{escape_like_pattern(tok)}%"
+                    named = (db.query(GalleryFace.image_id)
+                             .join(GalleryPerson, GalleryPerson.id == GalleryFace.person_id)
+                             .filter(GalleryPerson.name.ilike(term, escape="\\")))
                     q = q.filter(or_(
                         GalleryImage.prompt.ilike(term, escape="\\"),
                         GalleryImage.tags.ilike(term, escape="\\"),
                         GalleryImage.ai_tags.ilike(term, escape="\\"),
+                        GalleryImage.id.in_(named),   # people's names
                     ))
 
             # Tag filter. The UI stacks multiple tag pills by passing them
@@ -1290,6 +1297,12 @@ def setup_gallery_routes() -> APIRouter:
             # Favorites filter
             if favorites:
                 q = q.filter(GalleryImage.favorite == True)
+
+            # Person filter (recognised faces)
+            if person:
+                q = q.filter(GalleryImage.id.in_(
+                    db.query(GalleryFace.image_id).filter(GalleryFace.person_id == person,
+                                                          GalleryFace.ignored != True)))  # noqa: E712
 
             # Library source / folder filter (folder = relative path prefix)
             if source:

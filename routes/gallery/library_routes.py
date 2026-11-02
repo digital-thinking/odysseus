@@ -190,6 +190,8 @@ def register_library_routes(router: APIRouter) -> None:
             embeddings.delete_ids(ids)
             for image_id in ids:
                 remove_thumbnail(image_id)
+            from src.gallery_faces.index import delete_faces_of_images
+            delete_faces_of_images(db, ids)
             db.query(GalleryImage).filter(GalleryImage.source_id == src.id).delete(synchronize_session=False)
             db.delete(src)
             db.commit()
@@ -212,13 +214,13 @@ def register_library_routes(router: APIRouter) -> None:
                 raise HTTPException(400, "This library folder is disabled")
             # The Scan choices become the folder's auto-sync choices.
             settings = normalize_sync_settings(
-                {k: body[k] for k in ("embed", "tag") if k in body}, base=sync_settings(src))
+                {k: body[k] for k in ("embed", "tag", "faces") if k in body}, base=sync_settings(src))
             src.sync_settings = settings
             db.commit()
         finally:
             db.close()
         try:
-            job = jobs.start(source_id, embed=settings["embed"], tag=settings["tag"])
+            job = jobs.start(source_id, embed=settings["embed"], tag=settings["tag"], faces=settings["faces"])
         except jobs.JobAlreadyRunning as exc:
             raise HTTPException(409, str(exc))
         return {"ok": True, "job": job}

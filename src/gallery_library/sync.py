@@ -20,7 +20,7 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 TASK_ACTION = "index_gallery_library"
-DEFAULT_OPTIONS: dict[str, Any] = {"embed": True, "tag": False}
+DEFAULT_OPTIONS: dict[str, Any] = {"embed": True, "tag": False, "faces": False}
 _PROGRESS_POLL_SECONDS = 2
 
 
@@ -77,6 +77,11 @@ def _summary(name: str, job: dict) -> tuple[str, bool, bool]:
     embedded = (result.get("embedding") or {}).get("embedded") or 0
     if embedded:
         bits.append(f"{embedded} added to smart search")
+    faces = result.get("faces") or {}
+    if faces.get("faces"):
+        bits.append(f"{faces['faces']} faces found")
+    if faces.get("matched"):
+        bits.append(f"{faces['matched']} recognised")
     tagging = result.get("tagging") or {}
     if tagging.get("tagged"):
         bits.append(f"{tagging['tagged']} AI-tagged")
@@ -110,7 +115,8 @@ async def run_index_task(owner: str, progress_cb: Optional[Callable[[str], None]
     lines, worked, all_ok = [], False, True
     for source_id, name, options in sources:
         run = asyncio.ensure_future(asyncio.to_thread(
-            jobs.run_now, source_id, embed=options["embed"], tag=options["tag"], trigger="task"))
+            jobs.run_now, source_id, embed=options["embed"], tag=options["tag"], faces=options["faces"],
+            trigger="task"))
         try:
             while not run.done():
                 current = jobs.status()

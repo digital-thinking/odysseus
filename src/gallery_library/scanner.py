@@ -179,6 +179,7 @@ def scan_source(
                         stats["unchanged"] += 1  # only the mtime or the thumbnail needed refreshing
                         continue
                     row.ai_tags = ""  # new content: re-tag it (the user's own tags stay)
+                    row.faces_scanned = None  # ... and look for faces again
                     stats["updated"] += 1
                 else:
                     row = GalleryImage(

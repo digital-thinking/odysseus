@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 from urllib.parse import unquote, urlparse
-from sqlalchemy import DDL, event, create_engine, Column, String, Text, Boolean, DateTime, Integer, Float, ForeignKey, JSON, Index, func, inspect, text
+from sqlalchemy import DDL, event, create_engine, Column, String, Text, Boolean, DateTime, Integer, Float, ForeignKey, JSON, Index, LargeBinary, func, inspect, text
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.types import TypeDecorator
 from sqlalchemy.ext.declarative import declarative_base, declared_attr
@@ -403,6 +403,35 @@ class GalleryLibrarySource(TimestampMixin, Base):
     sync_settings   = Column(JSON, nullable=True)
 
 
+class GalleryPerson(TimestampMixin, Base):
+    """A person recognised across gallery photos (a group of faces), named or not."""
+    __tablename__ = "gallery_people"
+
+    id           = Column(String, primary_key=True, index=True)
+    owner        = Column(String, nullable=True, index=True)
+    name         = Column(String, nullable=True, index=True)   # None = not named yet
+    cover_face_id = Column(String, nullable=True)
+
+
+class GalleryFace(TimestampMixin, Base):
+    """One detected face: where it is, its embedding, and who it is (if known)."""
+    __tablename__ = "gallery_faces"
+
+    id         = Column(String, primary_key=True, index=True)
+    owner      = Column(String, nullable=True, index=True)
+    image_id   = Column(String, ForeignKey("gallery_images.id", ondelete="CASCADE"), nullable=False, index=True)
+    person_id  = Column(String, ForeignKey("gallery_people.id", ondelete="SET NULL"), nullable=True, index=True)
+    # box relative to the (EXIF-rotated) photo, 0..1
+    box_x      = Column(Float, nullable=False)
+    box_y      = Column(Float, nullable=False)
+    box_w      = Column(Float, nullable=False)
+    box_h      = Column(Float, nullable=False)
+    score      = Column(Float, nullable=True)
+    embedding  = Column(LargeBinary, nullable=True)   # float32[512], L2-normalised
+    assigned   = Column(String, nullable=True)        # auto | cluster | user
+    ignored    = Column(Boolean, default=False)       # "not a face" / don't group it
+
+
 class GalleryImage(TimestampMixin, Base):
     """Stores metadata for photos and AI-generated images."""
     __tablename__ = "gallery_images"
@@ -441,6 +470,7 @@ class GalleryImage(TimestampMixin, Base):
     source_relpath = Column(Text, nullable=True)     # POSIX path relative to the source root
     source_mtime   = Column(Float, nullable=True)    # change detection on rescan
     source_state   = Column(String, nullable=True)   # ok | missing | hidden
+    faces_scanned  = Column(String, nullable=True)   # face model pack the photo was scanned with
 
     session = relationship("Session", backref=backref("gallery_images"))
     album   = relationship("GalleryAlbum", back_populates="images")
@@ -1645,6 +1675,7 @@ def _migrate_add_gallery_library_columns():
             ("source_relpath", "TEXT"),
             ("source_mtime", "REAL"),
             ("source_state", "TEXT"),
+            ("faces_scanned", "TEXT"),
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE gallery_images ADD COLUMN {name} {ddl}")

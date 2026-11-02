@@ -1459,3 +1459,46 @@ body.gallery-selecting .gallery-dl-btn,
 .gallery-tag-model-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; font-size: 11px; }
 .gallery-tag-model-row select { flex: 1; min-width: 0; }
 .gallery-detail-library-path { font-size: 11px; opacity: 0.8; word-break: break-all; }
+
+/* ---- People (recognised faces) ---- */
+.gallery-people-container { padding: 6px 2px; }
+.gallery-people-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.gallery-people-summary { font-size: 11px; opacity: 0.7; flex: 1; }
+.gallery-people-hint { font-size: 10px; opacity: 0.6; margin: -4px 0 10px; }
+.gallery-people-empty { font-size: 12px; opacity: 0.7; padding: 24px 8px; text-align: center; }
+.gallery-people-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(118px, 1fr)); gap: 12px; }
+.gallery-person-card { text-align: center; cursor: pointer; padding: 6px; border-radius: 8px; }
+.gallery-person-card:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.gallery-person-card img {
+  width: 96px; height: 96px; border-radius: 50%; object-fit: cover;
+  border: 2px solid var(--border); background: var(--border);
+}
+.gallery-person-name { font-size: 12px; font-weight: 600; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.gallery-person-name .unnamed { font-weight: 400; opacity: 0.55; font-style: italic; }
+.gallery-person-count { font-size: 10px; opacity: 0.6; }
+.gallery-person-name-input { flex: 1 1 220px; min-width: 0; }
+.gallery-faces-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; }
+.gallery-face-tile { position: relative; cursor: pointer; border-radius: 8px; overflow: hidden; aspect-ratio: 1; background: var(--border); }
+.gallery-face-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.gallery-face-remove {
+  position: absolute; top: 3px; right: 3px; width: 20px; height: 20px; border-radius: 50%;
+  border: none; background: rgba(0, 0, 0, 0.6); color: #fff; font-size: 13px; line-height: 1;
+  cursor: pointer; opacity: 0; transition: opacity 0.12s;
+}
+.gallery-face-tile:hover .gallery-face-remove { opacity: 1; }
+.gallery-face-auto {
+  position: absolute; left: 4px; bottom: 4px; font-size: 9px; padding: 0 4px; border-radius: 3px;
+  background: rgba(0, 0, 0, 0.55); color: #fff;
+}
+.gallery-face-box {
+  position: absolute; pointer-events: auto; cursor: pointer;
+  border: 2px solid rgba(255, 255, 255, 0.85); border-radius: 6px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.35);
+}
+.gallery-face-box.unknown { border-style: dashed; }
+.gallery-face-box span {
+  position: absolute; left: -2px; top: 100%; margin-top: 3px; white-space: nowrap;
+  font-size: 11px; font-weight: 600; padding: 1px 6px; border-radius: 4px;
+  background: rgba(0, 0, 0, 0.65); color: #fff;
+}
+.gallery-person-chip.unknown { font-style: italic; opacity: 0.8; }
