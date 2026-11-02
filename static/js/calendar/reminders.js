@@ -56,7 +56,12 @@ const _REMINDER_STALENESS_MIN = 5;
 
 async function _pollReminders() {
   try {
-    const res = await fetch(`${API_BASE}/api/notes?label=calendar`, { credentials: 'same-origin' });
+    // A background poll from any open tab: must not count as the user being
+    // active, or it stops scheduled tasks (email, calendar, gallery index) every minute.
+    const res = await fetch(`${API_BASE}/api/notes?label=calendar`, {
+      credentials: 'same-origin',
+      headers: { 'X-Odysseus-Passive-Poll': '1' },
+    });
     if (!res.ok) return;
     const notes = await res.json();
     const now = new Date();

@@ -49,7 +49,7 @@ class _FakeClient:
         return _FakeStreamCtx(self.captured_payload)
 
 
-def _capture_payload(monkeypatch, url, model):
+def _capture_payload(monkeypatch, url, model, **stream_kwargs):
     """Run stream_llm, intercept the HTTP payload, and return it."""
     client = _FakeClient()
     monkeypatch.setattr(llm_core, "_get_http_client", lambda: client)
@@ -60,7 +60,7 @@ def _capture_payload(monkeypatch, url, model):
 
     async def run():
         return [c async for c in llm_core.stream_llm(
-            url, model, [{"role": "user", "content": "hi"}],
+            url, model, [{"role": "user", "content": "hi"}], **stream_kwargs,
         )]
 
     asyncio.run(run())
@@ -139,6 +139,32 @@ class TestThinkSuppression:
             monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "qwen3:14b"
         )
         assert payload.get("think") is False
+
+    def test_reasoning_effort_none_is_what_ollama_v1_honours(self, monkeypatch):
+        """Ollama's /v1 ignores ``think``; ``reasoning_effort: none`` is what
+        actually stops qwen3.5 from reasoning (it otherwise spent >180s and
+        returned no content)."""
+        payload = _capture_payload(
+            monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "qwen3.5:9b"
+        )
+        assert payload.get("reasoning_effort") == "none"
+
+    def test_explicit_thinking_on_keeps_reasoning(self, monkeypatch):
+        payload = _capture_payload(
+            monkeypatch, "http://127.0.0.1:11434/v1/chat/completions", "qwen3.5:9b", thinking_mode="on"
+        )
+        assert "reasoning_effort" not in payload and "think" not in payload
+
+    def test_no_reasoning_effort_for_other_models_or_endpoints(self, monkeypatch):
+        for url, model in (("http://127.0.0.1:11434/v1/chat/completions", "llama3.2:3b"),
+                           ("https://api.openai.com/v1/chat/completions", "qwen3:14b")):
+            payload = _capture_payload(monkeypatch, url, model)
+            assert "reasoning_effort" not in payload
+
+    def test_suppression_helper_does_not_override_an_explicit_effort(self):
+        payload = {"reasoning_effort": "low"}
+        llm_core._suppress_ollama_openai_thinking(payload, None)
+        assert payload == {"reasoning_effort": "low", "think": False}
 
     def test_no_think_for_ollama_v1_non_thinking_model(self, monkeypatch):
         """think must NOT be set for a plain (non-thinking) model on Ollama /v1."""

@@ -219,10 +219,11 @@ class _RequestTimeoutMiddleware(_BaseHTTPMiddleware):
 
 class _InteractiveActivityMiddleware(_BaseHTTPMiddleware):
     async def dispatch(self, request, call_next):
-        from src.interactive_gate import should_track_interactive_request, track_interactive_request
+        from src.interactive_gate import PASSIVE_POLL_HEADER, should_track_interactive_request, track_interactive_request
 
         path = request.url.path or ""
-        if not should_track_interactive_request(path, request.method):
+        passive_poll = request.headers.get(PASSIVE_POLL_HEADER) == "1"
+        if not should_track_interactive_request(path, request.method, passive_poll=passive_poll):
             return await call_next(request)
         async def _stop_background():
             try:

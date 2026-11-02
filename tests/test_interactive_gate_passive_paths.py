@@ -17,3 +17,12 @@ def test_real_interactive_paths_still_tracked():
 def test_options_never_tracked():
     assert should_track_interactive_request("/api/email/unread-state", method="OPTIONS") is False
     assert should_track_interactive_request("/api/chat_stream", method="OPTIONS") is False
+
+
+def test_background_polls_marked_passive_do_not_count_as_activity():
+    """The calendar reminder poller runs every 60 s in every open tab; it must
+    not stop scheduled background tasks."""
+    assert should_track_interactive_request("/api/notes", "GET", passive_poll=True) is False
+    assert should_track_interactive_request("/api/notes", "GET") is True
+    # only reads can be marked background
+    assert should_track_interactive_request("/api/notes", "POST", passive_poll=True) is True

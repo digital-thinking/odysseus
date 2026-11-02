@@ -1625,6 +1625,9 @@ async def action_classify_events(owner: str, **kwargs) -> Tuple[str, bool]:
                         messages=[{"role": "user", "content": prompt}],
                         temperature=0.1, max_tokens=16384,
                         timeout=180,
+                        # A short JSON classification: reasoning only burns the
+                        # timeout (qwen3.5 on Ollama spent >180s thinking).
+                        thinking_mode="off",
                     )
                     from src.text_helpers import strip_think as _st
                     raw = _st(raw or "", prose=False, prompt_echo=False)

@@ -92,10 +92,18 @@ async def maybe_stop_background_tasks_for_heartbeat(stop_background) -> bool:
     return True
 
 
-def should_track_interactive_request(path: str, method: str = "GET") -> bool:
+# Background UI polls (e.g. the calendar reminder poller) send this header so an
+# idle open tab does not count as someone using Odysseus. Only GETs honour it:
+# a client can mark its own reads as background, never a write.
+PASSIVE_POLL_HEADER = "X-Odysseus-Passive-Poll"
+
+
+def should_track_interactive_request(path: str, method: str = "GET", *, passive_poll: bool = False) -> bool:
     if not _enabled():
         return False
     if (method or "").upper() == "OPTIONS":
+        return False
+    if passive_poll and (method or "GET").upper() in ("GET", "HEAD"):
         return False
     if path in _PASSIVE_EXACT_PATHS:
         return False

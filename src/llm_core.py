@@ -716,6 +716,22 @@ def _is_ollama_native_url(url: str) -> bool:
     return local_ollama_host and (path == "" or path == "/api" or path.startswith("/api/"))
 
 
+def _suppress_ollama_openai_thinking(payload: Dict, thinking_mode: Optional[str] = None) -> None:
+    """Switch reasoning off for a thinking model on Ollama's OpenAI-compat /v1.
+
+    Ollama's /v1 surface ignores the top-level ``think`` flag; it turns
+    reasoning off via ``reasoning_effort: "none"`` (measured on Ollama 0.40:
+    qwen3.5 with only ``think: false`` reasoned for 200 s and returned no
+    content; with ``reasoning_effort: "none"`` it answered in 3 s). Unknown
+    values are ignored, so older builds are unaffected. ``think`` is kept for
+    builds that do read it. An explicit ``thinking_mode="on"`` keeps thinking.
+    """
+    if _normalize_thinking_mode(thinking_mode) == "on":
+        return
+    payload["think"] = False
+    payload.setdefault("reasoning_effort", "none")
+
+
 def _is_ollama_openai_compat_url(url: str) -> bool:
     """Return True for local Ollama's OpenAI-compatible /v1 surface.
 
@@ -2801,7 +2817,7 @@ async def llm_call_async(
             and _supports_thinking(model)
             and not _is_odysseus_qwen_tool_router_model(model)
         ):
-            payload["think"] = False
+            _suppress_ollama_openai_thinking(payload, thinking_mode)
         if provider == "mistral" and _supports_thinking(model):
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         _apply_local_cache_affinity(payload, url, session_id)
@@ -3074,13 +3090,13 @@ async def _stream_llm_inner(url: str, model: str, messages: List[Dict], temperat
             payload["reasoning_effort"] = _MISTRAL_REASONING_EFFORT
         # For Ollama's OpenAI-compat /v1 endpoint with thinking models (qwen3,
         # gemma4, etc.), suppress thinking so tool calls aren't swallowed inside
-        # <think> blocks. Ollama /v1 accepts "think": false as a top-level param.
+        # <think> blocks (see _suppress_ollama_openai_thinking for the fields).
         if (
             _is_ollama_openai_compat_url(url)
             and _supports_thinking(model)
             and not _is_odysseus_qwen_tool_router_model(model)
         ):
-            payload["think"] = False
+            _suppress_ollama_openai_thinking(payload, thinking_mode)
         _apply_local_cache_affinity(payload, url, session_id)
         _apply_local_generation_stability(payload, target_url, model)
         _apply_local_qwen_thinking_mode(payload, target_url, model, thinking_mode)
