@@ -42,6 +42,28 @@ logger = logging.getLogger(__name__)
 _SAM_STATE: Dict[str, Any] = {}
 _GROUNDING_STATE: Dict[str, Any] = {}
 
+# Tags compare trimmed and with ASCII letters lower-cased: exactly what SQLite's
+# lower()/LIKE do, so the Tags tab counts and the exact_tag filter always agree.
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+_SIMILAR_RESULTS = 200   # "Similar photos": how many nearest neighbours to list
+
+
+def _tag_key(tag: str) -> str:
+    return str(tag or "").strip().translate(_ASCII_LOWER)
+
+
+def _tag_keys(tags: Optional[str], ai_tags: Optional[str]) -> set:
+    """The distinct tags of one photo: the user's own and the AI tags."""
+    return {_tag_key(t) for t in f"{tags or ''},{ai_tags or ''}".split(",")} - {""}
+
+
+def _whole_tags_sql():
+    """``,tag one,tag two,`` for a row (user + AI tags, as stored ", "-joined) for whole-tag LIKE."""
+    from sqlalchemy import String, func, literal
+    both = func.lower(func.coalesce(GalleryImage.tags, "") + "," + func.coalesce(GalleryImage.ai_tags, ""))
+    joined = func.replace(func.replace(both, ", ", ",", type_=String), " ,", ",", type_=String)
+    return literal(",") + joined + ","
+
 
 def _compose_cloud_image_edit(source, generated, mask, *, instruction=False):
     from PIL import Image, ImageChops, ImageOps
@@ -1193,6 +1215,49 @@ def setup_gallery_routes() -> APIRouter:
         finally:
             db.close()
 
+    # ---- GET /api/gallery/tag-counts ----
+    @router.get("/api/gallery/tag-counts")
+    async def gallery_tag_counts(
+        request: Request,
+        q: Optional[str] = Query(None),
+        offset: int = Query(0, ge=0),
+        limit: int = Query(120, ge=1, le=500),
+    ) -> Dict[str, Any]:
+        """Tags (yours and AI) with how many photos carry each, most used first.
+
+        The cover is the newest photo with that tag. Counts use the same whole-tag
+        match as the ``exact_tag`` filter, so opening a tag shows exactly that many.
+        """
+        from sqlalchemy import func as _func
+        from sqlalchemy.orm import load_only
+
+        user = get_current_user(request)
+        db = SessionLocal()
+        try:
+            rows = (_owner_filter(db.query(GalleryImage), user)
+                    .options(load_only(GalleryImage.id, GalleryImage.filename, GalleryImage.source_id,
+                                       GalleryImage.tags, GalleryImage.ai_tags))
+                    .filter(GalleryImage.is_active == True)  # noqa: E712
+                    .order_by(_func.coalesce(GalleryImage.taken_at, GalleryImage.created_at).desc(),
+                              GalleryImage.id)
+                    .all())
+            counts: Dict[str, int] = {}
+            covers: Dict[str, str] = {}
+            for img in rows:
+                for tag in _tag_keys(img.tags, img.ai_tags):
+                    counts[tag] = counts.get(tag, 0) + 1
+                    if tag not in covers:
+                        covers[tag] = _image_urls(img)[1]
+            needle = _tag_key(q or "")
+            ranked = sorted((t for t in counts if needle in t), key=lambda t: (-counts[t], t))
+            return {
+                "tags": [{"tag": t, "count": counts[t], "cover_url": covers[t]}
+                         for t in ranked[offset:offset + limit]],
+                "total": len(ranked),
+            }
+        finally:
+            db.close()
+
     # ---- GET /api/gallery/library ----
     @router.get("/api/gallery/library")
     async def gallery_library(
@@ -1210,6 +1275,8 @@ def setup_gallery_routes() -> APIRouter:
         folder: Optional[str] = Query(None),
         semantic: bool = Query(False),
         person: Optional[str] = Query(None),
+        exact_tag: Optional[str] = Query(None),
+        similar_to: Optional[str] = Query(None),
     ) -> Dict[str, Any]:
         user = get_current_user(request)
         db = SessionLocal()
@@ -1246,7 +1313,22 @@ def setup_gallery_routes() -> APIRouter:
             # Smart search: rank by visual similarity (SigLIP 2 embeddings)
             # instead of keyword matching; other filters still apply below.
             ranked_ids = None
-            if semantic and search and search.strip():
+            if similar_to:
+                # "Similar photos": nearest neighbours of one photo's vector.
+                from src.gallery_library import embeddings as _lib_embeddings
+                ref = _owner_filter(db.query(GalleryImage.id).filter(GalleryImage.id == similar_to), user).first()
+                if ref is None:
+                    raise HTTPException(404, "Image not found")
+                try:
+                    hits = await asyncio.to_thread(_lib_embeddings.similar, user, similar_to, _SIMILAR_RESULTS)
+                except _lib_embeddings.NotIndexed:
+                    raise HTTPException(409, "This photo is not in the smart-search index yet — "
+                                             "scan its library folder with Smart search turned on")
+                except _lib_embeddings.SmartSearchUnavailable as exc:
+                    raise HTTPException(503, f"Similar photos unavailable: {exc}")
+                ranked_ids = [image_id for image_id, _score in hits]
+                q = q.filter(GalleryImage.id.in_(ranked_ids or [""]))
+            if semantic and search and search.strip() and ranked_ids is None:
                 from src.gallery_library import embeddings as _lib_embeddings
                 try:
                     hits = await asyncio.to_thread(_lib_embeddings.search, user, search, 200)
@@ -1286,6 +1368,12 @@ def setup_gallery_routes() -> APIRouter:
                         GalleryImage.ai_tags.ilike(safe_tag, escape="\\"),
                     ))
 
+            # Whole-tag filter (Tags tab): "man" finds the tag "man", not "woman"
+            # or "young man" like the substring tag filter above does.
+            if exact_tag and _tag_key(exact_tag):
+                q = q.filter(_whole_tags_sql().like(
+                    f"%,{escape_like_pattern(_tag_key(exact_tag))},%", escape="\\"))
+
             # Model filter
             if model:
                 q = q.filter(GalleryImage.model == model)
@@ -1298,10 +1386,11 @@ def setup_gallery_routes() -> APIRouter:
             if favorites:
                 q = q.filter(GalleryImage.favorite == True)
 
-            # Person filter (recognised faces)
-            if person:
+            # Person filter (recognised faces). Several ids, comma-separated:
+            # photos showing all of those people.
+            for person_id in {p.strip() for p in (person or "").split(",")} - {""}:
                 q = q.filter(GalleryImage.id.in_(
-                    db.query(GalleryFace.image_id).filter(GalleryFace.person_id == person,
+                    db.query(GalleryFace.image_id).filter(GalleryFace.person_id == person_id,
                                                           GalleryFace.ignored != True)))  # noqa: E712
 
             # Library source / folder filter (folder = relative path prefix)

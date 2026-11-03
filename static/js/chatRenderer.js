@@ -2148,6 +2148,10 @@ export function buildImageBubble(imageUrl, prompt, model, size, quality, imageId
       const albumsContainer = document.getElementById('gallery-albums-container');
       if (imagesContainer) imagesContainer.style.display = 'none';
       if (albumsContainer) albumsContainer.style.display = 'none';
+      for (const id of ['gallery-people-container', 'gallery-tags-container', 'gallery-settings-container']) {
+        const el = document.getElementById(id);
+        if (el) el.style.display = 'none';
+      }
       const editorContainer = document.getElementById('gallery-editor-container');
       if (editorContainer) editorContainer.style.display = 'flex';
       const label = (prompt || '').trim().slice(0, 60) || 'Generated image';

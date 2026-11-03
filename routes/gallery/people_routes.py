@@ -103,8 +103,8 @@ def register_people_routes(router: APIRouter) -> None:
                     "id": person.id, "name": person.name, "face_count": faces, "photo_count": photos,
                     "cover_url": f"/api/gallery/faces/{person.cover_face_id}/crop" if person.cover_face_id else None,
                 })
-            # named people A–Z first, then unnamed groups by size
-            people.sort(key=lambda p: (p["name"] is None, (p["name"] or "").lower(), -p["face_count"]))
+            # most photos first; a tie puts named people (A–Z) before unnamed groups
+            people.sort(key=lambda p: (-p["photo_count"], p["name"] is None, (p["name"] or "").lower()))
             unknown = _active_faces(db, user).filter(
                 GalleryFace.person_id == None).count()  # noqa: E711
             return {"people": people, "unknown_faces": unknown}
@@ -117,11 +117,16 @@ def register_people_routes(router: APIRouter) -> None:
         db = SessionLocal()
         try:
             person = _person_or_404(db, person_id, user)
-            rows = (_active_faces(db, user).filter(GalleryFace.person_id == person.id)
-                    .with_entities(GalleryFace, GalleryImage)
-                    .order_by(GalleryImage.taken_at.desc()).offset(offset).limit(min(limit, 500)).all())
+            faces = _active_faces(db, user).filter(GalleryFace.person_id == person.id)
+            total = faces.count()
+            photos = faces.with_entities(func.count(func.distinct(GalleryFace.image_id))).scalar() or 0
+            # The face id breaks ties so pages never repeat or skip a face.
+            rows = (faces.with_entities(GalleryFace, GalleryImage)
+                    .order_by(GalleryImage.taken_at.desc(), GalleryFace.id)
+                    .offset(max(offset, 0)).limit(max(1, min(limit, 500))).all())
             return {"person": {"id": person.id, "name": person.name},
-                    "faces": [_face_dict(f, person, img) for f, img in rows]}
+                    "faces": [_face_dict(f, person, img) for f, img in rows],
+                    "total": total, "photo_count": photos}
         finally:
             db.close()
 
@@ -130,10 +135,12 @@ def register_people_routes(router: APIRouter) -> None:
         user = get_current_user(request)
         db = SessionLocal()
         try:
-            rows = (_active_faces(db, user).filter(GalleryFace.person_id == None)  # noqa: E711
-                    .with_entities(GalleryFace, GalleryImage)
-                    .order_by(GalleryFace.score.desc()).offset(offset).limit(min(limit, 500)).all())
-            return {"faces": [_face_dict(f, None, img) for f, img in rows]}
+            faces = _active_faces(db, user).filter(GalleryFace.person_id == None)  # noqa: E711
+            total = faces.count()
+            rows = (faces.with_entities(GalleryFace, GalleryImage)
+                    .order_by(GalleryFace.score.desc(), GalleryFace.id)
+                    .offset(max(offset, 0)).limit(max(1, min(limit, 500))).all())
+            return {"faces": [_face_dict(f, None, img) for f, img in rows], "total": total}
         finally:
             db.close()
 

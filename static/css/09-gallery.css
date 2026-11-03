@@ -1478,6 +1478,36 @@ body.gallery-selecting .gallery-dl-btn,
 .gallery-person-count { font-size: 10px; opacity: 0.6; }
 .gallery-person-name-input { flex: 1 1 220px; min-width: 0; }
 .gallery-faces-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 8px; }
+.gallery-faces-grid + .gallery-load-more, .gallery-tags-grid + .gallery-load-more { margin: 12px auto 4px; display: block; }
+
+/* ---- Search box: people type-ahead ---- */
+.gallery-search-suggest {
+  position: absolute; left: 0; right: 0; top: calc(100% + 6px); z-index: 30;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25); padding: 4px; max-height: 320px; overflow-y: auto;
+}
+.gallery-search-suggest[hidden] { display: none; }
+.gallery-suggest-head { font-size: 10px; opacity: 0.55; padding: 2px 6px 4px; text-transform: uppercase; letter-spacing: 0.04em; }
+.gallery-suggest-item {
+  display: flex; align-items: center; gap: 8px; width: 100%; padding: 4px 6px;
+  background: none; border: none; border-radius: 6px; color: var(--fg); font: inherit; font-size: 12px;
+  cursor: pointer; text-align: left;
+}
+.gallery-suggest-item.active, .gallery-suggest-item:hover { background: color-mix(in srgb, var(--fg) 9%, transparent); }
+.gallery-suggest-item img { width: 26px; height: 26px; border-radius: 50%; object-fit: cover; background: var(--border); flex: none; }
+.gallery-suggest-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.gallery-suggest-count { font-size: 10px; opacity: 0.6; flex: none; }
+
+/* ---- Tags tab ---- */
+.gallery-search.gallery-tags-filter { flex: 0 1 260px; min-width: 140px; top: 0; padding-right: 8px; }
+.gallery-tags-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(132px, 1fr)); gap: 10px; }
+.gallery-tag-card { cursor: pointer; padding: 6px; border-radius: 8px; min-width: 0; }
+.gallery-tag-card:hover { background: color-mix(in srgb, var(--fg) 6%, transparent); }
+.gallery-tag-card img {
+  width: 100%; aspect-ratio: 1; object-fit: cover; display: block;
+  border-radius: 8px; background: var(--border);
+}
+.gallery-tag-card-name { font-size: 12px; font-weight: 600; margin-top: 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .gallery-face-tile { position: relative; cursor: pointer; border-radius: 8px; overflow: hidden; aspect-ratio: 1; background: var(--border); }
 .gallery-face-tile img { width: 100%; height: 100%; object-fit: cover; display: block; }
 .gallery-face-remove {

@@ -185,6 +185,33 @@ def search(owner: Optional[str], query: str, k: int = 200) -> list[tuple[str, fl
     return [(image_id, 1.0 - float(dist)) for image_id, dist in zip(ids, distances)]
 
 
+class NotIndexed(LookupError):
+    """The photo has no vector yet (not indexed for smart search)."""
+
+
+def similar(owner: Optional[str], image_id: str, k: int = 200) -> list[tuple[str, float]]:
+    """Photos that look most like ``image_id``, as ``(id, similarity)``, most similar first.
+
+    Uses the photo's stored vector as the query, so no model has to be loaded:
+    Chroma answers from its HNSW (approximate nearest neighbour) index. The
+    photo itself is left out.
+    """
+    col = _collection()
+    got = col.get(ids=[image_id], include=["embeddings"])
+    vectors = got.get("embeddings")
+    if vectors is None or len(vectors) == 0:
+        raise NotIndexed(image_id)
+    total = col.count()
+    kwargs = {"query_embeddings": [[float(x) for x in vectors[0]]],
+              "n_results": max(1, min(k + 1, total)), "include": ["distances"]}
+    if owner is not None:
+        kwargs["where"] = {"owner": owner}
+    result = col.query(**kwargs)
+    ids = (result.get("ids") or [[]])[0]
+    distances = (result.get("distances") or [[]])[0]
+    return [(i, 1.0 - float(d)) for i, d in zip(ids, distances) if i != image_id][:k]
+
+
 def delete_ids(ids: list[str]) -> None:
     if not ids:
         return

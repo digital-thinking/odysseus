@@ -278,6 +278,103 @@ def test_smart_search_ranks_by_similarity_and_keeps_filters(lib, monkeypatch):
     assert client.get("/api/gallery/library", params={"search": "x", "semantic": "true"}).status_code == 503
 
 
+def _ids_by_path(lib):
+    db = lib["db"]()
+    try:
+        return {r.source_relpath: r.id for r in db.query(GalleryImage).all()}
+    finally:
+        db.close()
+
+
+def test_similar_photos_are_the_nearest_neighbours_of_one_photo(lib, monkeypatch):
+    from src.gallery_library import embeddings
+    source_id = _add_source(lib, path=HOST_ROOT).json()["source"]["id"]
+    _scan(lib, source_id)
+    ids = _ids_by_path(lib)
+    sep, juni, later = ids["2005/04 sep/Foto(01).jpg"], ids["2005/2 Juni/Foto(01).jpg"], ids["2006/later.jpg"]
+    calls = []
+
+    def fake_similar(owner, image_id, k=200):
+        calls.append((owner, image_id))
+        return [(later, 0.93), (juni, 0.41)]
+
+    monkeypatch.setattr(embeddings, "similar", fake_similar)
+    client = lib["client"]
+    body = client.get("/api/gallery/library", params={"similar_to": sep}).json()
+    assert [i["id"] for i in body["items"]] == [later, juni] and body["total"] == 2   # most similar first
+    assert calls == [("alice", sep)]
+    narrowed = client.get("/api/gallery/library", params={"similar_to": sep, "source": source_id, "folder": "2005"}).json()
+    assert [i["id"] for i in narrowed["items"]] == [juni]
+    # someone else's photo can't be used to look into the index
+    assert client.get("/api/gallery/library", params={"similar_to": sep}, headers={"x-user": "bob"}).status_code == 404
+
+    def not_indexed(owner, image_id, k=200):
+        raise embeddings.NotIndexed(image_id)
+
+    monkeypatch.setattr(embeddings, "similar", not_indexed)
+    resp = client.get("/api/gallery/library", params={"similar_to": sep})
+    assert resp.status_code == 409 and "smart-search index" in resp.json()["detail"]
+
+
+def test_similar_asks_the_ann_index_with_the_photos_own_vector(monkeypatch):
+    from src.gallery_library import embeddings
+
+    class FakeCollection:
+        def __init__(self):
+            self.queries = []
+
+        def get(self, ids, include):
+            return {"ids": ids, "embeddings": [[0.6, 0.8]] if ids == ["a"] else []}
+
+        def count(self):
+            return 3
+
+        def query(self, **kwargs):
+            self.queries.append(kwargs)
+            return {"ids": [["a", "b", "c"]], "distances": [[0.0, 0.1, 0.5]]}
+
+    col = FakeCollection()
+    monkeypatch.setattr(embeddings, "_collection", lambda: col)
+    assert embeddings.similar("alice", "a", k=5) == [("b", pytest.approx(0.9)), ("c", pytest.approx(0.5))]
+    (query,) = col.queries
+    assert query["query_embeddings"] == [[0.6, 0.8]] and query["where"] == {"owner": "alice"}
+    assert query["n_results"] == 3   # never more than the index holds
+    with pytest.raises(embeddings.NotIndexed):
+        embeddings.similar("alice", "not-indexed")
+
+
+def test_tag_counts_list_most_used_first_and_open_exactly_those_photos(lib):
+    source_id = _add_source(lib, path=HOST_ROOT).json()["source"]["id"]
+    _scan(lib, source_id)
+    db = lib["db"]()
+    rows = {r.source_relpath: r for r in db.query(GalleryImage).all()}
+    rows["2005/2 Juni/Foto(01).jpg"].ai_tags = "man, beach, blue sky"
+    rows["2005/04 sep/Foto(01).jpg"].ai_tags = "woman, beach"
+    rows["2005/04 sep/Foto(01).jpg"].tags = "Beach, holiday"   # own tag, other case: still one photo
+    rows["2006/later.jpg"].ai_tags = "young man, beach"
+    db.commit()
+    ids = {path: row.id for path, row in rows.items()}
+    db.close()
+
+    client = lib["client"]
+    body = client.get("/api/gallery/tag-counts").json()
+    assert body["total"] == 6
+    assert [(t["tag"], t["count"]) for t in body["tags"]] == [
+        ("beach", 3), ("blue sky", 1), ("holiday", 1), ("man", 1), ("woman", 1), ("young man", 1)]
+    assert body["tags"][0]["cover_url"] == f"/api/gallery/{ids['2006/later.jpg']}/thumb"   # newest photo
+    found = client.get("/api/gallery/tag-counts", params={"q": "MAN"}).json()
+    assert [t["tag"] for t in found["tags"]] == ["man", "woman", "young man"]
+    paged = client.get("/api/gallery/tag-counts", params={"offset": 1, "limit": 2}).json()
+    assert [t["tag"] for t in paged["tags"]] == ["blue sky", "holiday"] and paged["total"] == 6
+
+    # opening a tag shows exactly the photos counted: "man" is not "woman" or "young man"
+    man = client.get("/api/gallery/library", params={"exact_tag": "man"}).json()
+    assert [i["id"] for i in man["items"]] == [ids["2005/2 Juni/Foto(01).jpg"]]
+    assert client.get("/api/gallery/library", params={"exact_tag": "Beach"}).json()["total"] == 3
+    assert client.get("/api/gallery/library", params={"exact_tag": "%"}).json()["total"] == 0
+    assert client.get("/api/gallery/tag-counts", headers={"x-user": "bob"}).json() == {"tags": [], "total": 0}
+
+
 def test_background_job_scans_and_reports(lib):
     from src.gallery_library import jobs
     source_id = _add_source(lib, path=HOST_ROOT, include_paths=["2005"]).json()["source"]["id"]

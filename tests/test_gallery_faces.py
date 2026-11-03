@@ -173,6 +173,44 @@ def test_corrections_stick_and_same_names_merge(faces_env):
     assert client.get("/api/gallery/people").json() == {"people": [], "unknown_faces": 6}
 
 
+def test_people_are_listed_by_photo_count_and_all_their_faces_can_be_paged(faces_env):
+    client = faces_env["client"]
+    _index(faces_env)
+    green = _faces_by_file(faces_env)["green0.jpg"]
+    client.post(f"/api/gallery/faces/{green.id}", json={"name": "Anna"})
+    people = client.get("/api/gallery/people").json()["people"]
+    assert [(p["name"], p["photo_count"]) for p in people] == [("Anna", 3), (None, 3)]   # a tie: named first
+
+    _photo(faces_env["root"] / "2005" / "red3.jpg", "red", shade=3)
+    _index(faces_env)
+    people = client.get("/api/gallery/people").json()["people"]
+    assert [(p["name"], p["photo_count"]) for p in people] == [(None, 4), ("Anna", 3)]   # most photos first
+
+    url = f"/api/gallery/people/{people[0]['id']}/faces"
+    first = client.get(url, params={"limit": 3}).json()
+    rest = client.get(url, params={"offset": 3, "limit": 3}).json()
+    assert (first["total"], first["photo_count"], len(first["faces"]), len(rest["faces"])) == (4, 4, 3, 1)
+    assert len({f["id"] for f in first["faces"] + rest["faces"]}) == 4   # no face repeated or skipped
+    unknown = client.get("/api/gallery/faces/unknown").json()
+    assert unknown["total"] == 1 and len(unknown["faces"]) == 1
+
+
+def test_photos_can_be_filtered_by_several_people_at_once(faces_env):
+    client = faces_env["client"]
+    _index(faces_env)
+    faces = _faces_by_file(faces_env)
+    lena = client.post(f"/api/gallery/faces/{faces['red0.jpg'].id}", json={"name": "Lena"}).json()["face"]["person_id"]
+    tom = client.post(f"/api/gallery/faces/{faces['green0.jpg'].id}", json={"name": "Tom"}).json()["face"]["person_id"]
+    db = faces_env["db"]()   # Tom is in red1.jpg too, next to Lena
+    db.add(GalleryFace(id="tom-in-red1", owner="alice", image_id=faces["red1.jpg"].image_id, person_id=tom,
+                       box_x=0.6, box_y=0.2, box_w=0.2, box_h=0.3, score=0.9, assigned="user"))
+    db.commit()
+    db.close()
+    both = client.get("/api/gallery/library", params={"person": f"{lena},{tom}"}).json()
+    assert [i["source_path"] for i in both["items"]] == ["2005/red1.jpg"]   # photos with all of them
+    assert client.get("/api/gallery/library", params={"person": tom}).json()["total"] == 4
+
+
 def test_photo_faces_have_relative_boxes_and_names(faces_env):
     client = faces_env["client"]
     _index(faces_env)
