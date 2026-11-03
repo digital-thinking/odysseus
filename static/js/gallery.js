@@ -628,6 +628,11 @@ function _renderIndexTask(task) {
     + `<a href="#" class="gallery-index-task-link" data-task-id="${_esc(task.id)}">Schedule or pause it in Tasks</a>`;
 }
 
+function _unreadableList(stats) {
+  const files = Object.keys((stats && stats.unreadable_files) || {}).sort();
+  return files.length ? `Unreadable files (empty or damaged, left untouched):\n${files.join('\n')}` : '';
+}
+
 function _scanSummary(stats) {
   if (!stats || !Object.keys(stats).length) return 'Not scanned yet';
   const bits = [];
@@ -635,7 +640,8 @@ function _scanSummary(stats) {
   if (stats.updated) bits.push(`${stats.updated} updated`);
   if (stats.missing) bits.push(`${stats.missing} no longer in the folder`);
   if (stats.skipped_videos) bits.push(`${stats.skipped_videos} videos skipped`);
-  if (stats.errors) bits.push(`${stats.errors} unreadable`);
+  const unreadable = stats.unreadable ?? stats.errors;
+  if (unreadable) bits.push(`${unreadable} unreadable${_unreadableList(stats) ? ' (hover for the list)' : ''}`);
   if (stats.tagging && stats.tagging.error) bits.push(`tagging stopped: ${stats.tagging.error}`);
   return bits.join(' · ') || 'Up to date';
 }
@@ -670,7 +676,7 @@ async function _loadLibrarySources() {
         <div class="gallery-source-main">
           <div class="gallery-source-name">${_esc(src.name)} <span class="gallery-source-ro" title="Odysseus never writes to this folder">read-only</span></div>
           <div class="gallery-source-path">${_esc(src.path)}${(src.include_paths || []).length ? ` · only ${_esc(src.include_paths.join(', '))}` : ''}</div>
-          <div class="gallery-source-stats">${src.photo_count} photos · ${src.tagged_count} AI-tagged · scanned ${_esc(_scanTime(src.last_scan_at))}<br>${_esc(_scanSummary(src.last_scan_stats))}</div>
+          <div class="gallery-source-stats" title="${_esc(_unreadableList(src.last_scan_stats))}">${src.photo_count} photos · ${src.tagged_count} AI-tagged · scanned ${_esc(_scanTime(src.last_scan_at))}<br>${_esc(_scanSummary(src.last_scan_stats))}</div>
         </div>
         <div class="gallery-source-actions">
           <label title="Add new photos to the ✨ smart-search index"><input type="checkbox" class="gallery-source-opt-embed"${src.sync?.embed === false ? '' : ' checked'}> Smart search</label>

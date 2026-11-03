@@ -435,6 +435,23 @@ def test_the_gallery_progress_poll_does_not_count_as_user_activity():
     assert should_track_interactive_request("/api/gallery/library", "GET") is True
 
 
+def test_a_broken_photo_is_reported_once_not_every_night(lib, fake_index):
+    from src.builtin_actions import TaskNoop
+    source_id = _add_source(lib, path=HOST_ROOT, include_paths=["2005"], name="Privat").json()["source"]["id"]
+    broken = lib["root"] / "2005" / "kaputt.jpg"
+    broken.write_bytes(b"")                       # an empty file in the photo folder
+    message, ok = _run_index_task()
+    assert not ok and "1 unreadable" in message   # newly broken: worth a look
+    with pytest.raises(TaskNoop):                 # the same broken file again: a quiet night
+        _run_index_task()
+    stats = _scan(lib, source_id)
+    assert (stats["errors"], stats["unreadable"], list(stats["unreadable_files"])) == (0, 1, ["2005/kaputt.jpg"])
+
+    _jpeg(broken, color=(9, 9, 9))                # the original is restored
+    stats = _scan(lib, source_id)
+    assert (stats["new"], stats["errors"], stats["unreadable"], stats["unreadable_files"]) == (1, 0, 0, {})
+
+
 def test_index_task_reports_an_unreachable_folder(lib, fake_index):
     import shutil
     _add_source(lib, path=HOST_ROOT, include_paths=["2005"], name="Privat")

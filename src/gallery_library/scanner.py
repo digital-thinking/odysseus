@@ -95,9 +95,16 @@ def scan_source(
             raise FileNotFoundError(f"Library folder not reachable: {source.display_path or root}")
         includes = normalize_include_paths(source.include_paths)
 
+        # "errors" counts files that became unreadable in this scan; "unreadable"
+        # counts all broken files. A file already known to be broken (same size
+        # and mtime as last time) is not read or reported again, so a few
+        # damaged originals don't turn every nightly run into a failure.
         stats = {"found": 0, "new": 0, "updated": 0, "unchanged": 0, "reactivated": 0,
-                 "missing": 0, "skipped_videos": 0, "skipped_other": 0, "errors": 0}
+                 "missing": 0, "skipped_videos": 0, "skipped_other": 0, "errors": 0, "unreadable": 0}
         error_samples: list[str] = []
+        known_unreadable = dict((source.last_scan_stats or {}).get("unreadable_files") or {})
+        unreadable: dict[str, list] = {}
+        visited: set[str] = set()
 
         progress("listing", 0, 0)
         images: list[tuple[str, str]] = []
@@ -134,12 +141,18 @@ def scan_source(
             if cancel is not None and cancel.is_set():
                 cancelled = True
                 break
+            visited.add(rel)
+            st = None
             try:
                 row = existing.get(rel)
                 if row is not None and row.source_state == "hidden":
                     stats["unchanged"] += 1
                     continue
                 st = os.stat(abs_path)
+                if known_unreadable.get(rel) == [st.st_size, st.st_mtime]:
+                    unreadable[rel] = [st.st_size, st.st_mtime]   # still the same broken file
+                    stats["unreadable"] += 1
+                    continue
                 if (row is not None and row.source_mtime == st.st_mtime
                         and row.file_size == st.st_size and os.path.exists(thumb_path(row.id))):
                     if row.source_state != "ok" or not row.is_active:
@@ -198,6 +211,9 @@ def scan_source(
                 changed_ids.append(image_id)
             except Exception as exc:  # one unreadable photo must not stop the scan
                 stats["errors"] += 1
+                stats["unreadable"] += 1
+                if st is not None:
+                    unreadable[rel] = [st.st_size, st.st_mtime]
                 if len(error_samples) < _MAX_ERROR_SAMPLES:
                     error_samples.append(f"{rel}: {exc}")
                 logger.warning("Library scan: %s failed: %s", rel, exc)
@@ -219,8 +235,13 @@ def scan_source(
                 row.source_state, row.is_active = "missing", False
                 stats["missing"] += 1
 
+        if cancelled:   # files this scan did not reach stay known as broken
+            for rel, known in known_unreadable.items():
+                if rel not in visited:
+                    unreadable.setdefault(rel, known)
         stats["cancelled"] = cancelled
         stats["error_samples"] = error_samples
+        stats["unreadable_files"] = unreadable
         source.last_scan_at = utcnow_naive()
         source.last_scan_stats = dict(stats)
         db.commit()
