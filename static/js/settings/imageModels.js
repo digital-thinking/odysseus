@@ -9,6 +9,136 @@ import { modelCaps } from '../editor/ai-models.js';
 import { sortModelIds } from '../modelSort.js';
 let preferencesListener = null;
 
+const IMAGE_SERVER_REFRESH_MS = 3000;
+const IDLE_CHOICES = [[5, '5 minutes'], [10, '10 minutes'], [30, '30 minutes'], [60, '1 hour'], [0, 'Never']];
+
+function imageServerStateText(server) {
+  if (server.state === 'starting') return 'Loading the model, this takes a minute or two…';
+  if (server.state === 'stopping') return 'Stopping…';
+  if (server.state === 'running') {
+    if (server.in_flight) return 'Running · making an image';
+    if (server.stops_in_seconds == null) return 'Running';
+    return `Running · stops in ${Math.max(1, Math.ceil(server.stops_in_seconds / 60))} min`;
+  }
+  return server.last_error || 'Stopped · starts by itself with the next image';
+}
+
+function imageServerRow(server, onCommand, onIdleChange) {
+  const row = document.createElement('div');
+  row.className = 'image-server-row';
+  row.dataset.serverId = server.id;
+
+  const name = document.createElement('span');
+  name.className = 'image-server-name';
+  name.textContent = server.name;
+
+  const state = document.createElement('span');
+  state.className = 'image-server-state';
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'admin-btn-sm image-server-toggle';
+  button.addEventListener('click', () => onCommand(server.id, button.dataset.action));
+
+  const idle = document.createElement('label');
+  idle.className = 'image-server-idle';
+  idle.textContent = 'Stop when idle for';
+  const select = document.createElement('select');
+  select.className = 'settings-select';
+  for (const [minutes, label] of IDLE_CHOICES) select.add(new Option(label, String(minutes)));
+  select.addEventListener('change', () => onIdleChange(server.id, Number(select.value)));
+  idle.appendChild(select);
+
+  row.append(name, state, button, idle);
+  return row;
+}
+
+function updateImageServerRow(row, server) {
+  const state = row.querySelector('.image-server-state');
+  state.textContent = imageServerStateText(server);
+  state.classList.toggle('is-error', server.state === 'stopped' && !!server.last_error);
+
+  const stopped = server.state === 'stopped';
+  const button = row.querySelector('.image-server-toggle');
+  button.dataset.action = stopped ? 'start' : 'stop';
+  button.textContent = stopped ? 'Start' : 'Stop';
+  button.disabled = server.state === 'stopping';
+
+  const select = row.querySelector('select');
+  if (document.activeElement === select) return;
+  const value = String(server.idle_minutes);
+  if (![...select.options].some(option => option.value === value)) {
+    select.add(new Option(`${server.idle_minutes} minutes`, value));
+  }
+  select.value = value;
+}
+
+// Local image servers that run under scripts/image_server_supervisor.py: shows
+// their state and offers Start, Stop and the idle time. Hidden when there are none.
+function initImageServers(msg) {
+  const container = el('set-imgServers');
+  if (!container) return;
+  const card = container.closest('.admin-card');
+  let timer = null;
+
+  function showError(text) {
+    if (!msg) return;
+    msg.textContent = text;
+    msg.style.color = 'var(--red)';
+  }
+
+  async function refresh() {
+    let servers;
+    try {
+      const res = await fetch('/api/image-servers', { credentials: 'same-origin' });
+      if (res.status === 401 || res.status === 403) {
+        clearInterval(timer);
+        return;
+      }
+      if (!res.ok) return;
+      servers = (await res.json()).servers || [];
+    } catch (_) {
+      return;
+    }
+    const rows = new Map([...container.children].map(row => [row.dataset.serverId, row]));
+    for (const server of servers) {
+      let row = rows.get(server.id);
+      if (!row) {
+        row = imageServerRow(server, onCommand, onIdleChange);
+        container.appendChild(row);
+      }
+      rows.delete(server.id);
+      updateImageServerRow(row, server);
+    }
+    rows.forEach(row => row.remove());
+    container.hidden = servers.length === 0;
+  }
+
+  async function post(id, path, body) {
+    try {
+      const res = await fetch(`/api/image-servers/${encodeURIComponent(id)}/${path}`, {
+        method: 'POST', credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body || {}),
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        showError(data.detail || 'The image server did not respond');
+      }
+    } catch (_) {
+      showError('The image server did not respond');
+    }
+    refresh();
+  }
+
+  const onCommand = (id, action) => post(id, action);
+  const onIdleChange = (id, minutes) => post(id, 'settings', { idle_minutes: minutes });
+
+  refresh();
+  timer = setInterval(() => {
+    if (!document.hidden && card?.offsetParent) refresh();
+  }, IMAGE_SERVER_REFRESH_MS);
+}
+
 export async function initImageSettings() {
   const modelSel = el('set-imgModelSelect');
   const editModelSel = el('set-imgEditModelSelect');
@@ -16,6 +146,7 @@ export async function initImageSettings() {
   const msg = el('set-imgSettingsMsg');
   const enabledToggle = el('set-imgEnabledToggle');
   const configWrap = modelSel ? modelSel.closest('div[style*="flex-direction"]') : null;
+  initImageServers(msg);
   try {
     const endpointsRes = await fetch('/api/model-endpoints', { credentials: 'same-origin' });
     const endpoints = await endpointsRes.json();

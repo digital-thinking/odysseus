@@ -665,6 +665,35 @@ span[id$="-logo"] svg:not([width]) {
   background: var(--border);
   border-color: var(--red);
 }
+.image-servers {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  padding-top: 0.5rem;
+  border-top: 1px solid var(--border);
+}
+.image-servers[hidden] { display: none; }
+.image-server-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.75rem;
+}
+.image-server-name { font-size: 12px; font-weight: 600; }
+.image-server-state {
+  flex: 1 1 200px;
+  min-width: 0;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--fg) 60%, transparent);
+}
+.image-server-state.is-error { color: var(--red); }
+.image-server-idle {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 11px;
+  color: color-mix(in srgb, var(--fg) 60%, transparent);
+}
 .admin-spinner {
   display: inline-block;
   width: 12px;

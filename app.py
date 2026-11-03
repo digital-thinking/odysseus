@@ -824,6 +824,10 @@ app.include_router(setup_embedding_routes())
 from routes.model_routes import setup_model_routes
 app.include_router(setup_model_routes(model_discovery))
 
+# Local image servers (start, stop, idle time)
+from routes.image_server_routes import setup_image_server_routes
+app.include_router(setup_image_server_routes())
+
 # GitHub Copilot device-flow login
 from routes.copilot_routes import setup_copilot_routes
 app.include_router(setup_copilot_routes())
