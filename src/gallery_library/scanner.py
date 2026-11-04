@@ -96,8 +96,9 @@ def scan_source(
         includes = normalize_include_paths(source.include_paths)
 
         # "errors" counts files that became unreadable in this scan; "unreadable"
-        # counts all broken files. A file already known to be broken (same size
-        # and mtime as last time) is not read or reported again, so a few
+        # counts all broken files. A broken file is read again on every scan,
+        # because a good copy put in its place can have the same size and date.
+        # If it is still the same broken file it is not reported again, so a few
         # damaged originals don't turn every nightly run into a failure.
         stats = {"found": 0, "new": 0, "updated": 0, "unchanged": 0, "reactivated": 0,
                  "missing": 0, "skipped_videos": 0, "skipped_other": 0, "errors": 0, "unreadable": 0}
@@ -149,10 +150,6 @@ def scan_source(
                     stats["unchanged"] += 1
                     continue
                 st = os.stat(abs_path)
-                if known_unreadable.get(rel) == [st.st_size, st.st_mtime]:
-                    unreadable[rel] = [st.st_size, st.st_mtime]   # still the same broken file
-                    stats["unreadable"] += 1
-                    continue
                 if (row is not None and row.source_mtime == st.st_mtime
                         and row.file_size == st.st_size and os.path.exists(thumb_path(row.id))):
                     if row.source_state != "ok" or not row.is_active:
@@ -210,13 +207,14 @@ def scan_source(
                     stats["new"] += 1
                 changed_ids.append(image_id)
             except Exception as exc:  # one unreadable photo must not stop the scan
-                stats["errors"] += 1
                 stats["unreadable"] += 1
                 if st is not None:
                     unreadable[rel] = [st.st_size, st.st_mtime]
-                if len(error_samples) < _MAX_ERROR_SAMPLES:
-                    error_samples.append(f"{rel}: {exc}")
-                logger.warning("Library scan: %s failed: %s", rel, exc)
+                if st is None or known_unreadable.get(rel) != [st.st_size, st.st_mtime]:
+                    stats["errors"] += 1
+                    if len(error_samples) < _MAX_ERROR_SAMPLES:
+                        error_samples.append(f"{rel}: {exc}")
+                    logger.warning("Library scan: %s failed: %s", rel, exc)
             finally:  # also runs for the `continue`s above (unchanged photos)
                 if index % _COMMIT_EVERY == 0:
                     db.commit()

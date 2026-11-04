@@ -376,8 +376,15 @@ class GalleryAlbum(TimestampMixin, Base):
     description = Column(Text, default="")
     cover_id    = Column(String, nullable=True)  # GalleryImage.id for cover photo
     owner       = Column(String, nullable=True, index=True)
+    # Albums made from a library folder (the "Folder albums" option); NULL = made by hand.
+    source_id     = Column(String, nullable=True)
+    source_folder = Column(Text, nullable=True)   # top-level folder name inside the source
 
     images = relationship("GalleryImage", back_populates="album")
+
+    __table_args__ = (
+        Index('ix_gallery_albums_source_folder', 'source_id', 'source_folder', unique=True),
+    )
 
 
 class GalleryLibrarySource(TimestampMixin, Base):
@@ -401,6 +408,8 @@ class GalleryLibrarySource(TimestampMixin, Base):
     last_scan_stats = Column(JSON, nullable=True)
     # What the "Gallery Library Index" task does for new photos: {"embed": true, "tag": false}
     sync_settings   = Column(JSON, nullable=True)
+    # Top-level folders whose automatic album the user deleted: not made again.
+    album_skip      = Column(JSON, nullable=True)
 
 
 class GalleryPerson(TimestampMixin, Base):
@@ -481,6 +490,81 @@ class GalleryImage(TimestampMixin, Base):
         Index('ix_gallery_images_active', 'is_active', 'created_at'),
         Index('ix_gallery_images_source_rel', 'source_id', 'source_relpath', unique=True),
     )
+
+
+class GalleryImageTag(Base):
+    """Which photos carry which tag, for filtering without reading every photo's tag text.
+
+    ``tag`` is compared like ``_tag_key`` in the gallery routes. The rows are
+    derived from ``gallery_images.tags`` and ``ai_tags`` and kept up to date by
+    the SQLite triggers below, so no code writes this table directly.
+    """
+    __tablename__ = "gallery_image_tags"
+
+    tag      = Column(String, primary_key=True)
+    image_id = Column(String, primary_key=True)
+
+    __table_args__ = {"sqlite_with_rowid": False}
+
+
+def _gallery_tags_of(row: str) -> str:
+    """SQL listing the tags of a trigger's ``old`` or ``new`` row.
+
+    json_quote keeps quotes and backslashes in a tag harmless, and a comma in
+    its output can only be a real separator.
+    """
+    both = f"lower(coalesce({row}.tags, '') || ',' || coalesce({row}.ai_tags, ''))"
+    return (
+        "SELECT DISTINCT trim(value, ' ' || char(9, 10, 13)) AS tag "
+        f"FROM json_each('[' || replace(json_quote({both}), ',', '\",\"') || ']') WHERE tag != ''"
+    )
+
+
+# Each page of the gallery used to read every photo row, and a face row carries a
+# 2 KB embedding. These indexes hold what filters, counts and sorting need, so
+# those queries never touch the wide rows. Partial indexes only apply to queries
+# that spell out the same condition with literals (see _HAS_AI_TAGS in the routes).
+_GALLERY_IMAGE_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_browse ON gallery_images "
+    "(owner, is_active, coalesce(taken_at, created_at) DESC, source_relpath DESC, id, source_id)",
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_recent ON gallery_images (owner, is_active, created_at DESC, id)",
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_models ON gallery_images (owner, is_active, model)",
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_lookup ON gallery_images (id, is_active, taken_at)",
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_album ON gallery_images "
+    "(album_id, is_active, owner, created_at DESC)",
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_changed ON gallery_images (owner, updated_at)",
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_prompt ON gallery_images (prompt, id)",
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_user_tags ON gallery_images (owner, is_active, tags) "
+    "WHERE tags IS NOT NULL AND tags != ''",
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_ai_tagged ON gallery_images (owner, is_active, id, source_id) "
+    "WHERE ai_tags IS NOT NULL AND ai_tags != ''",
+)
+_GALLERY_FACE_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS ix_gallery_faces_owner_person ON gallery_faces "
+    "(owner, person_id, ignored, image_id, score, id)",
+    "CREATE INDEX IF NOT EXISTS ix_gallery_faces_person_image ON gallery_faces (person_id, ignored, image_id)",
+)
+_GALLERY_TAG_TRIGGERS = (
+    "CREATE TRIGGER IF NOT EXISTS gallery_images_tags_ai AFTER INSERT ON gallery_images BEGIN "
+    f"INSERT OR IGNORE INTO gallery_image_tags (tag, image_id) SELECT tag, new.id FROM ({_gallery_tags_of('new')}); "
+    "END",
+    "CREATE TRIGGER IF NOT EXISTS gallery_images_tags_au AFTER UPDATE OF tags, ai_tags ON gallery_images BEGIN "
+    f"DELETE FROM gallery_image_tags WHERE image_id = old.id AND tag IN ({_gallery_tags_of('old')}); "
+    f"INSERT OR IGNORE INTO gallery_image_tags (tag, image_id) SELECT tag, new.id FROM ({_gallery_tags_of('new')}); "
+    "END",
+    "CREATE TRIGGER IF NOT EXISTS gallery_images_tags_ad AFTER DELETE ON gallery_images BEGIN "
+    f"DELETE FROM gallery_image_tags WHERE image_id = old.id AND tag IN ({_gallery_tags_of('old')}); "
+    "END",
+)
+
+# Fresh databases get these with create_all(); the startup migration
+# (_migrate_gallery_tag_index) installs the same statements on existing ones.
+for _gallery_table, _gallery_ddl in (
+    (GalleryImage.__table__, _GALLERY_IMAGE_INDEXES + _GALLERY_TAG_TRIGGERS),
+    (GalleryFace.__table__, _GALLERY_FACE_INDEXES),
+):
+    for _statement in _gallery_ddl:
+        event.listen(_gallery_table, "after_create", DDL(_statement).execute_if(dialect="sqlite"))
 
 
 class EmailAccount(TimestampMixin, Base):
@@ -1684,6 +1768,19 @@ def _migrate_add_gallery_library_columns():
         if source_columns and "sync_settings" not in source_columns:
             conn.execute("ALTER TABLE gallery_library_sources ADD COLUMN sync_settings JSON")
             added.append("gallery_library_sources.sync_settings")
+        if source_columns and "album_skip" not in source_columns:
+            conn.execute("ALTER TABLE gallery_library_sources ADD COLUMN album_skip JSON")
+            added.append("gallery_library_sources.album_skip")
+        album_columns = [row[1] for row in conn.execute("PRAGMA table_info(gallery_albums)").fetchall()]
+        if album_columns:
+            for name in ("source_id", "source_folder"):
+                if name not in album_columns:
+                    conn.execute(f"ALTER TABLE gallery_albums ADD COLUMN {name} TEXT")
+                    added.append(f"gallery_albums.{name}")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_gallery_albums_source_folder "
+                "ON gallery_albums (source_id, source_folder)"
+            )
         conn.execute("CREATE INDEX IF NOT EXISTS ix_gallery_images_source_id ON gallery_images (source_id)")
         conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS ix_gallery_images_source_rel "
@@ -1694,6 +1791,42 @@ def _migrate_add_gallery_library_columns():
             logging.getLogger(__name__).info("Migrated: added %s to gallery_images", ", ".join(added))
     except Exception as e:
         logging.getLogger(__name__).warning(f"Migration gallery library columns failed: {e}")
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _migrate_gallery_tag_index():
+    """Install the gallery's speed indexes and triggers, and fill the tag table once."""
+    if not DATABASE_URL.startswith("sqlite"):
+        return
+    import sqlite3
+    db_path = DATABASE_URL.replace("sqlite:///", "")
+    if not os.path.exists(db_path):
+        return
+    conn = None
+    try:
+        conn = sqlite3.connect(db_path, timeout=60)
+        tables = {row[0] for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        if not {"gallery_images", "gallery_faces", "gallery_image_tags"} <= tables:
+            return
+        for statement in _GALLERY_IMAGE_INDEXES + _GALLERY_FACE_INDEXES + _GALLERY_TAG_TRIGGERS:
+            conn.execute(statement)
+        if conn.execute("SELECT 1 FROM gallery_image_tags LIMIT 1").fetchone() is None:
+            # Sorted, so the table is written front to back: about ten times faster.
+            both = "lower(coalesce(g.tags, '') || ',' || coalesce(g.ai_tags, ''))"
+            conn.execute(
+                "INSERT OR IGNORE INTO gallery_image_tags (tag, image_id) "
+                "SELECT trim(j.value, ' ' || char(9, 10, 13)) AS tag, g.id FROM gallery_images g, "
+                f"json_each('[' || replace(json_quote({both}), ',', '\",\"') || ']') j "
+                "WHERE tag != '' ORDER BY 1, 2"
+            )
+            logging.getLogger(__name__).info("Migrated: filled gallery_image_tags")
+        conn.commit()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"Migration gallery tag index failed: {e}")
     finally:
         try:
             conn.close()
@@ -2541,6 +2674,7 @@ def init_db():
     _migrate_add_multiuser_owner_columns()
     _migrate_add_gallery_caption_column()
     _migrate_add_gallery_library_columns()
+    _migrate_gallery_tag_index()
     _migrate_add_api_token_scopes_column()
     _migrate_backfill_document_owner_from_session()
     _migrate_assign_legacy_owner()

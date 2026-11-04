@@ -695,6 +695,7 @@ async function _loadLibrarySources() {
           <label title="Add new photos to the ✨ smart-search index"><input type="checkbox" class="gallery-source-opt-embed"${src.sync?.embed === false ? '' : ' checked'}> Smart search</label>
           <label title="AI-tag new photos (tagging model below)"><input type="checkbox" class="gallery-source-opt-tag"${src.sync?.tag ? ' checked' : ''}> AI tags</label>
           <label title="Find faces in new photos and recognise people (People tab)"><input type="checkbox" class="gallery-source-opt-faces"${src.sync?.faces ? ' checked' : ''}> People</label>
+          <label title="Make one album per top-level folder and keep it up to date"><input type="checkbox" class="gallery-source-opt-albums"${src.sync?.albums ? ' checked' : ''}> Folder albums</label>
           <button class="memory-toolbar-btn gallery-source-edit" data-include="${_esc((src.include_paths || []).join(', '))}" title="Choose which subfolders are included">Subfolders</button>
           <button class="memory-toolbar-btn gallery-source-scan" title="Scan now (only new or changed photos are processed)">Scan now</button>
           <button class="memory-toolbar-btn gallery-source-remove" title="Forget this folder in Odysseus — the photos themselves are not touched">Remove</button>
@@ -729,6 +730,7 @@ function _renderLibraryJob(job) {
     const r = job.result;
     const bits = [];
     if (r.scan) bits.push(`${r.scan.new} new, ${r.scan.updated} updated, ${r.scan.unchanged} unchanged`);
+    if (r.albums?.created) bits.push(`${r.albums.created} new album${r.albums.created === 1 ? '' : 's'}`);
     if (r.embedding) bits.push(`${r.embedding.embedded} added to smart search`);
     if (r.faces) bits.push(`${r.faces.faces} faces found, ${r.faces.matched || 0} recognised, ${r.faces.new_people || 0} new people`);
     if (r.tagging) bits.push(r.tagging.error ? `tagging stopped: ${r.tagging.error}` : `${r.tagging.tagged} AI-tagged`);
@@ -752,6 +754,7 @@ function _pollLibraryJob() {
       _libraryPoll = null;
       _loadLibrarySources();
       _fetchFolders();
+      _fetchAlbums();
       _fetchLibrary(false);
     }
   }, 1500);
@@ -809,10 +812,11 @@ function _wireLibrarySettings() {
       const embed = row.querySelector('.gallery-source-opt-embed')?.checked ?? true;
       const tag = row.querySelector('.gallery-source-opt-tag')?.checked ?? false;
       const faces = row.querySelector('.gallery-source-opt-faces')?.checked ?? false;
+      const albums = row.querySelector('.gallery-source-opt-albums')?.checked ?? false;
       const res = await fetch(`${API_BASE}/api/gallery/sources/${encodeURIComponent(id)}/scan`, {
         method: 'POST', credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ embed, tag, faces }),
+        body: JSON.stringify({ embed, tag, faces, albums }),
       });
       const data = await res.json().catch(() => ({}));
       if (!res.ok) { uiModule.showError(data.detail || 'Could not start the scan'); return; }
@@ -830,6 +834,7 @@ function _wireLibrarySettings() {
       if (_activeFolder && _activeFolder.source === id) _activeFolder = null;
       _loadLibrarySources();
       _fetchFolders();
+      _fetchAlbums();
       _fetchLibrary(false);
       _renderAlbums();
     }
@@ -837,13 +842,14 @@ function _wireLibrarySettings() {
   // The Smart search / AI tags choices are saved per folder (used by Scan now
   // and by the scheduled index task).
   document.getElementById('gallery-sources-list')?.addEventListener('change', async (e) => {
-    if (!e.target.closest('.gallery-source-opt-embed, .gallery-source-opt-tag, .gallery-source-opt-faces')) return;
+    if (!e.target.closest('.gallery-source-opt-embed, .gallery-source-opt-tag, .gallery-source-opt-faces, .gallery-source-opt-albums')) return;
     const row = e.target.closest('.gallery-source-row');
     if (!row) return;
     const sync = {
       embed: !!row.querySelector('.gallery-source-opt-embed')?.checked,
       tag: !!row.querySelector('.gallery-source-opt-tag')?.checked,
       faces: !!row.querySelector('.gallery-source-opt-faces')?.checked,
+      albums: !!row.querySelector('.gallery-source-opt-albums')?.checked,
     };
     const res = await fetch(`${API_BASE}/api/gallery/sources/${encodeURIComponent(row.dataset.id)}`, {
       method: 'PATCH', credentials: 'same-origin',
@@ -853,6 +859,7 @@ function _wireLibrarySettings() {
     const data = await res.json().catch(() => ({}));
     if (!res.ok) { uiModule.showError(data.detail || 'Could not save the sync settings'); return; }
     _loadLibrarySources();
+    _fetchAlbums();
   });
   document.getElementById('gallery-index-task')?.addEventListener('click', async (e) => {
     const link = e.target.closest('.gallery-index-task-link');

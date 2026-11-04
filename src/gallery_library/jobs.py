@@ -1,8 +1,9 @@
 """Background indexing job for library sources (one at a time, in-process).
 
-Phases: ``scanning`` (rows + thumbnails) → ``embedding`` (smart-search
-vectors) → ``tagging`` (AI tags via the tagging model). Each phase only works
-on what is new or missing, so re-running a scan is cheap.
+Phases: ``scanning`` (rows + thumbnails, then folder albums if the source wants
+them) → ``embedding`` (smart-search vectors) → ``tagging`` (AI tags via the
+tagging model). Each phase only works on what is new or missing, so re-running
+a scan is cheap.
 """
 
 from __future__ import annotations
@@ -130,6 +131,10 @@ def _run(source_id: str, embed: bool, tag: bool, faces: bool = False) -> None:
             # phase (now or on the next run) indexes the current content.
             from src.gallery_library import embeddings
             embeddings.delete_ids(scan["changed_ids"])
+        if not _cancel.is_set():
+            albums = _albums_source(source_id)
+            if albums is not None:
+                result["albums"] = albums
         if embed and not _cancel.is_set():
             result["embedding"] = _embed_source(source_id)
         if faces and not _cancel.is_set():
@@ -144,6 +149,21 @@ def _run(source_id: str, embed: bool, tag: bool, faces: bool = False) -> None:
     finally:
         _update(finished_at=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
         _store_job_result(source_id, result)
+
+
+def _albums_source(source_id: str) -> Optional[dict]:
+    """Update the folder albums of a source that uses them."""
+    from core.database import GalleryLibrarySource, SessionLocal
+    from src.gallery_library.albums import sync_albums
+    from src.gallery_library.sync import sync_settings
+
+    db = SessionLocal()
+    try:
+        source = db.query(GalleryLibrarySource).filter(GalleryLibrarySource.id == source_id).first()
+        wanted = source is not None and sync_settings(source)["albums"]
+    finally:
+        db.close()
+    return sync_albums(source_id) if wanted else None
 
 
 def _faces_source(source_id: str) -> dict:
@@ -262,7 +282,7 @@ def _store_job_result(source_id: str, result: dict) -> None:
         if source is None:
             return
         stats = dict(source.last_scan_stats or {})
-        for key in ("embedding", "faces", "tagging"):
+        for key in ("albums", "embedding", "faces", "tagging"):
             if key in result:
                 stats[key] = result[key]
         source.last_scan_stats = stats

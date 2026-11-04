@@ -21,7 +21,7 @@ from typing import Any, Callable, Optional
 logger = logging.getLogger(__name__)
 
 TASK_ACTION = "index_gallery_library"
-DEFAULT_OPTIONS: dict[str, Any] = {"embed": True, "tag": False, "faces": False}
+DEFAULT_OPTIONS: dict[str, Any] = {"embed": True, "tag": False, "faces": False, "albums": False}
 _PROGRESS_POLL_SECONDS = 2
 
 
@@ -75,6 +75,9 @@ def _summary(name: str, job: dict) -> tuple[str, bool, bool]:
                        ("reactivated", "back"), ("errors", "unreadable")):
         if scan.get(key):
             bits.append(f"{scan[key]} {label}")
+    albums = (result.get("albums") or {}).get("created") or 0
+    if albums:
+        bits.append(f"{albums} new album{'' if albums == 1 else 's'}")
     embedded = (result.get("embedding") or {}).get("embedded") or 0
     if embedded:
         bits.append(f"{embedded} added to smart search")

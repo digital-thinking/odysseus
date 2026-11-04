@@ -14,8 +14,13 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from sqlalchemy import func, or_, select, text
+from sqlalchemy.orm import aliased
 
-from core.database import SessionLocal, GalleryImage, GalleryAlbum, ModelEndpoint, GalleryFace, GalleryPerson
+from core.database import (
+    SessionLocal, GalleryImage, GalleryImageTag, GalleryAlbum, GalleryLibrarySource, ModelEndpoint, GalleryFace,
+    GalleryPerson,
+)
 from core.database import Session as DbSession
 from src.auth_helpers import get_current_user, owner_filter, require_privilege
 from src.session_search import escape_like_pattern
@@ -33,6 +38,8 @@ from routes.gallery.gallery_helpers import (
 )
 from routes.gallery.library_routes import register_library_routes
 from routes.gallery.people_routes import register_people_routes
+from routes.gallery import tag_stats
+from routes.gallery.tag_stats import tag_key as _tag_key
 from src.gallery_library.files import is_library_image, library_file_path, remove_thumbnail
 
 LIBRARY_READ_ONLY = "Library photos are read-only — the original stays untouched in its folder"
@@ -42,19 +49,29 @@ logger = logging.getLogger(__name__)
 _SAM_STATE: Dict[str, Any] = {}
 _GROUNDING_STATE: Dict[str, Any] = {}
 
-# Tags compare trimmed and with ASCII letters lower-cased: exactly what SQLite's
-# lower()/LIKE do, so the Tags tab counts and the exact_tag filter always agree.
-_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 _SIMILAR_RESULTS = 200   # "Similar photos": how many nearest neighbours to list
 
 
-def _tag_key(tag: str) -> str:
-    return str(tag or "").strip().translate(_ASCII_LOWER)
+# Written with literals so SQLite can use the partial indexes on these conditions.
+_HAS_USER_TAGS = text("gallery_images.tags IS NOT NULL AND gallery_images.tags != ''")
+_HAS_AI_TAGS = text("gallery_images.ai_tags IS NOT NULL AND gallery_images.ai_tags != ''")
+_MAX_TAGS_PER_FILTER = 2000   # a broader match ("a") is cheaper as a plain text scan
 
 
-def _tag_keys(tags: Optional[str], ai_tags: Optional[str]) -> set:
-    """The distinct tags of one photo: the user's own and the AI tags."""
-    return {_tag_key(t) for t in f"{tags or ''},{ai_tags or ''}".split(",")} - {""}
+def _uses_tag_table(db) -> bool:
+    """gallery_image_tags is kept up to date by SQLite triggers; other databases have none."""
+    return db.get_bind().dialect.name == "sqlite"
+
+
+def _has_any_tag(tags):
+    """Photos carrying at least one of ``tags`` (already in tag_key form)."""
+    return GalleryImage.id.in_(select(GalleryImageTag.image_id).where(GalleryImageTag.tag.in_(tags)))
+
+
+def _tags_containing(stats, needle: str) -> Optional[list]:
+    """Tags with ``needle`` in them, or None when so many match that a text scan is better."""
+    found = [tag for tag in stats.counts if needle in tag]
+    return found if len(found) <= _MAX_TAGS_PER_FILTER else None
 
 
 def _whole_tags_sql():
@@ -1200,9 +1217,7 @@ def setup_gallery_routes() -> APIRouter:
         user = get_current_user(request)
         db = SessionLocal()
         try:
-            q = db.query(GalleryImage.tags).filter(
-                GalleryImage.is_active == True, GalleryImage.tags != None, GalleryImage.tags != ""
-            )
+            q = db.query(GalleryImage.tags).filter(GalleryImage.is_active == True, _HAS_USER_TAGS)
             q = _owner_filter(q, user)
             rows = q.all()
             tag_set = set()
@@ -1228,35 +1243,15 @@ def setup_gallery_routes() -> APIRouter:
         The cover is the newest photo with that tag. Counts use the same whole-tag
         match as the ``exact_tag`` filter, so opening a tag shows exactly that many.
         """
-        from sqlalchemy import func as _func
-        from sqlalchemy.orm import load_only
-
         user = get_current_user(request)
-        db = SessionLocal()
-        try:
-            rows = (_owner_filter(db.query(GalleryImage), user)
-                    .options(load_only(GalleryImage.id, GalleryImage.filename, GalleryImage.source_id,
-                                       GalleryImage.tags, GalleryImage.ai_tags))
-                    .filter(GalleryImage.is_active == True)  # noqa: E712
-                    .order_by(_func.coalesce(GalleryImage.taken_at, GalleryImage.created_at).desc(),
-                              GalleryImage.id)
-                    .all())
-            counts: Dict[str, int] = {}
-            covers: Dict[str, str] = {}
-            for img in rows:
-                for tag in _tag_keys(img.tags, img.ai_tags):
-                    counts[tag] = counts.get(tag, 0) + 1
-                    if tag not in covers:
-                        covers[tag] = _image_urls(img)[1]
-            needle = _tag_key(q or "")
-            ranked = sorted((t for t in counts if needle in t), key=lambda t: (-counts[t], t))
-            return {
-                "tags": [{"tag": t, "count": counts[t], "cover_url": covers[t]}
-                         for t in ranked[offset:offset + limit]],
-                "total": len(ranked),
-            }
-        finally:
-            db.close()
+        stats = await asyncio.to_thread(tag_stats.current, SessionLocal, user)
+        needle = _tag_key(q or "")
+        ranked = [t for t in stats.ranked if needle in t]
+        return {
+            "tags": [{"tag": t, "count": stats.counts[t], "cover_url": stats.covers[t]}
+                     for t in ranked[offset:offset + limit]],
+            "total": len(ranked),
+        }
 
     # ---- GET /api/gallery/library ----
     @router.get("/api/gallery/library")
@@ -1282,9 +1277,7 @@ def setup_gallery_routes() -> APIRouter:
         db = SessionLocal()
         try:
             # Distinct tags for filter UI
-            tag_q = db.query(GalleryImage.tags).filter(
-                GalleryImage.is_active == True, GalleryImage.tags != None, GalleryImage.tags != ""
-            )
+            tag_q = db.query(GalleryImage.tags).filter(GalleryImage.is_active == True, _HAS_USER_TAGS)
             tag_q = _owner_filter(tag_q, user)
             tag_rows = tag_q.all()
             all_tags = set()
@@ -1302,13 +1295,13 @@ def setup_gallery_routes() -> APIRouter:
             model_rows = model_q.distinct().all()
             all_models = sorted([m for (m,) in model_rows if m])
 
-            # Base query with left join to sessions for session_name
-            q = (
-                db.query(GalleryImage, DbSession.name)
-                .outerjoin(DbSession, GalleryImage.session_id == DbSession.id)
-                .filter(GalleryImage.is_active == True)
-            )
+            # Counting needs no session names: they are joined for the page's rows only.
+            q = db.query(GalleryImage).filter(GalleryImage.is_active == True)
             q = _owner_filter(q, user)
+            # Substring tag matching looks the tags up in the (cached) list of all tags.
+            stats = None
+            if _uses_tag_table(db) and (tag or (search and not semantic)):
+                stats = await asyncio.to_thread(tag_stats.current, SessionLocal, user)
 
             # Smart search: rank by visual similarity (SigLIP 2 embeddings)
             # instead of keyword matching; other filters still apply below.
@@ -1340,30 +1333,39 @@ def setup_gallery_routes() -> APIRouter:
             # exact phrase, so "red car" missed "a car that is red".
             # LIKE wildcards are escaped per token.
             elif search:
-                from sqlalchemy import or_
+                prompts = aliased(GalleryImage)
                 for tok in search.split():
                     term = f"%{escape_like_pattern(tok)}%"
-                    named = (db.query(GalleryFace.image_id)
-                             .join(GalleryPerson, GalleryPerson.id == GalleryFace.person_id)
-                             .filter(GalleryPerson.name.ilike(term, escape="\\")))
-                    q = q.filter(or_(
-                        GalleryImage.prompt.ilike(term, escape="\\"),
-                        GalleryImage.tags.ilike(term, escape="\\"),
-                        GalleryImage.ai_tags.ilike(term, escape="\\"),
-                        GalleryImage.id.in_(named),   # people's names
-                    ))
+                    matches = [
+                        # A subquery, so the wide photo rows are not read to look at the prompt.
+                        GalleryImage.id.in_(select(prompts.id).where(prompts.prompt.ilike(term, escape="\\"))),
+                        GalleryImage.id.in_(                # people's names
+                            db.query(GalleryFace.image_id)
+                            .join(GalleryPerson, GalleryPerson.id == GalleryFace.person_id)
+                            .filter(GalleryPerson.name.ilike(term, escape="\\"))),
+                    ]
+                    tags = _tags_containing(stats, _tag_key(tok.strip(","))) if stats else None
+                    if tags is None:
+                        matches += [GalleryImage.tags.ilike(term, escape="\\"),
+                                    GalleryImage.ai_tags.ilike(term, escape="\\")]
+                    else:
+                        matches.append(_has_any_tag(tags))
+                    q = q.filter(or_(*matches))
 
             # Tag filter. The UI stacks multiple tag pills by passing them
             # comma-separated — each tag adds a separate AND-filter so the
             # result set narrows as the user piles tags on. A single tag
             # (no commas) is the original behaviour.
             if tag:
-                from sqlalchemy import or_ as _or
                 for one in (t.strip() for t in tag.split(",")):
                     if not one:
                         continue
+                    tags = _tags_containing(stats, _tag_key(one)) if stats else None
+                    if tags is not None:
+                        q = q.filter(_has_any_tag(tags))
+                        continue
                     safe_tag = f"%{escape_like_pattern(one)}%"
-                    q = q.filter(_or(
+                    q = q.filter(or_(
                         GalleryImage.tags.ilike(safe_tag, escape="\\"),
                         GalleryImage.ai_tags.ilike(safe_tag, escape="\\"),
                     ))
@@ -1371,8 +1373,11 @@ def setup_gallery_routes() -> APIRouter:
             # Whole-tag filter (Tags tab): "man" finds the tag "man", not "woman"
             # or "young man" like the substring tag filter above does.
             if exact_tag and _tag_key(exact_tag):
-                q = q.filter(_whole_tags_sql().like(
-                    f"%,{escape_like_pattern(_tag_key(exact_tag))},%", escape="\\"))
+                if _uses_tag_table(db):
+                    q = q.filter(_has_any_tag([_tag_key(exact_tag)]))
+                else:
+                    q = q.filter(_whole_tags_sql().like(
+                        f"%,{escape_like_pattern(_tag_key(exact_tag))},%", escape="\\"))
 
             # Model filter
             if model:
@@ -1402,12 +1407,12 @@ def setup_gallery_routes() -> APIRouter:
                         f"{escape_like_pattern(folder_path)}/%", escape="\\"))
 
             # Total before pagination
-            total = q.count()
+            total = q.with_entities(func.count(GalleryImage.id)).scalar()
             # How many of those have AI tags — surfaced as "X/Y photos tagged"
-            # in the AI-tagging settings header.
-            total_tagged = q.filter(
-                GalleryImage.ai_tags.isnot(None), GalleryImage.ai_tags != ""
-            ).count()
+            # in the AI-tagging settings header. Only the first page needs it.
+            total_tagged = None
+            if offset == 0:
+                total_tagged = q.filter(_HAS_AI_TAGS).with_entities(func.count(GalleryImage.id)).scalar()
 
             # Sorting
             if ranked_ids is not None:
@@ -1446,8 +1451,8 @@ def setup_gallery_routes() -> APIRouter:
                 else:
                     rows = []
             else:
-                from sqlalchemy import func as _func
-                taken = _func.coalesce(GalleryImage.taken_at, GalleryImage.created_at)
+                taken = func.coalesce(GalleryImage.taken_at, GalleryImage.created_at)
+                q = q.add_columns(DbSession.name).outerjoin(DbSession, GalleryImage.session_id == DbSession.id)
                 if sort == "oldest":
                     q = q.order_by(GalleryImage.created_at.asc())
                 elif sort == "taken_desc":
@@ -1462,14 +1467,16 @@ def setup_gallery_routes() -> APIRouter:
             for img, session_name in rows:
                 items.append(_image_to_dict(img, session_name))
 
-            return {
+            result = {
                 "items": items,
                 "total": total,
-                "total_tagged": total_tagged,
                 "tags": sorted(all_tags),
                 "models": all_models,
                 "semantic": ranked_ids is not None,
             }
+            if total_tagged is not None:
+                result["total_tagged"] = total_tagged
+            return result
         except HTTPException:
             raise
         except Exception:
@@ -1487,7 +1494,9 @@ def setup_gallery_routes() -> APIRouter:
         try:
             q = db.query(GalleryAlbum)
             q = _owner_filter(q, user, GalleryAlbum)
-            albums = q.order_by(GalleryAlbum.created_at.desc()).all()
+            # Hand-made albums first, then folder albums with the newest trip first.
+            albums = q.order_by(GalleryAlbum.source_folder.isnot(None), GalleryAlbum.source_folder.desc(),
+                                GalleryAlbum.created_at.desc()).all()
             result = []
             for a in albums:
                 _count_q = db.query(GalleryImage).filter(
@@ -3229,6 +3238,11 @@ def setup_gallery_routes() -> APIRouter:
             if user is not None:
                 q = q.filter(GalleryImage.owner == user)
             q.update({"album_id": None}, synchronize_session=False)
+            if album.source_folder:
+                # A folder album the user deleted is not made again by the next scan.
+                source = db.query(GalleryLibrarySource).filter(GalleryLibrarySource.id == album.source_id).first()
+                if source is not None:
+                    source.album_skip = sorted({*(source.album_skip or []), album.source_folder})
             db.delete(album)
             db.commit()
             return {"ok": True}

@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from sqlalchemy import func
+from sqlalchemy.orm import defer
 
 from core.database import GalleryFace, GalleryImage, GalleryPerson, SessionLocal
 from routes.gallery.gallery_helpers import _image_urls, _owner_filter
@@ -40,6 +41,21 @@ def _active_faces(db, user):
          .join(GalleryImage, GalleryImage.id == GalleryFace.image_id)
          .filter(GalleryImage.is_active == True, GalleryFace.ignored != True))  # noqa: E712
     return _owner_filter(q, user, GalleryFace)
+
+
+def _count(faces) -> int:
+    return faces.with_entities(func.count(GalleryFace.id)).scalar() or 0
+
+
+def _page(db, faces, order, offset: int, limit: int) -> list:
+    """(face, photo) pairs of one page. The order is worked out on ids alone: a
+    face row carries a 2 KB embedding that no list of faces needs."""
+    ids = [i for (i,) in faces.with_entities(GalleryFace.id).order_by(*order)
+           .offset(max(offset, 0)).limit(max(1, min(limit, 500)))]
+    rows = (db.query(GalleryFace, GalleryImage).join(GalleryImage, GalleryImage.id == GalleryFace.image_id)
+            .options(defer(GalleryFace.embedding)).filter(GalleryFace.id.in_(ids)).all())
+    by_id = {face.id: (face, img) for face, img in rows}
+    return [by_id[i] for i in ids if i in by_id]
 
 
 def _find_person_by_name(db, user, name: str) -> Optional[GalleryPerson]:
@@ -105,8 +121,7 @@ def register_people_routes(router: APIRouter) -> None:
                 })
             # most photos first; a tie puts named people (A–Z) before unnamed groups
             people.sort(key=lambda p: (-p["photo_count"], p["name"] is None, (p["name"] or "").lower()))
-            unknown = _active_faces(db, user).filter(
-                GalleryFace.person_id == None).count()  # noqa: E711
+            unknown = _count(_active_faces(db, user).filter(GalleryFace.person_id == None))  # noqa: E711
             return {"people": people, "unknown_faces": unknown}
         finally:
             db.close()
@@ -118,12 +133,10 @@ def register_people_routes(router: APIRouter) -> None:
         try:
             person = _person_or_404(db, person_id, user)
             faces = _active_faces(db, user).filter(GalleryFace.person_id == person.id)
-            total = faces.count()
+            total = _count(faces)
             photos = faces.with_entities(func.count(func.distinct(GalleryFace.image_id))).scalar() or 0
             # The face id breaks ties so pages never repeat or skip a face.
-            rows = (faces.with_entities(GalleryFace, GalleryImage)
-                    .order_by(GalleryImage.taken_at.desc(), GalleryFace.id)
-                    .offset(max(offset, 0)).limit(max(1, min(limit, 500))).all())
+            rows = _page(db, faces, (GalleryImage.taken_at.desc(), GalleryFace.id), offset, limit)
             return {"person": {"id": person.id, "name": person.name},
                     "faces": [_face_dict(f, person, img) for f, img in rows],
                     "total": total, "photo_count": photos}
@@ -136,10 +149,8 @@ def register_people_routes(router: APIRouter) -> None:
         db = SessionLocal()
         try:
             faces = _active_faces(db, user).filter(GalleryFace.person_id == None)  # noqa: E711
-            total = faces.count()
-            rows = (faces.with_entities(GalleryFace, GalleryImage)
-                    .order_by(GalleryFace.score.desc(), GalleryFace.id)
-                    .offset(max(offset, 0)).limit(max(1, min(limit, 500))).all())
+            total = _count(faces)
+            rows = _page(db, faces, (GalleryFace.score.desc(), GalleryFace.id), offset, limit)
             return {"faces": [_face_dict(f, None, img) for f, img in rows], "total": total}
         finally:
             db.close()

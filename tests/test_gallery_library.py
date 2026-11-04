@@ -20,7 +20,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
 import core.database as core_db
-from core.database import Base, GalleryImage, GalleryLibrarySource
+from core.database import Base, GalleryAlbum, GalleryImage, GalleryImageTag, GalleryLibrarySource
 from src.gallery_library import files as lib_files
 from src.gallery_library import paths as lib_paths
 
@@ -375,6 +375,354 @@ def test_tag_counts_list_most_used_first_and_open_exactly_those_photos(lib):
     assert client.get("/api/gallery/tag-counts", headers={"x-user": "bob"}).json() == {"tags": [], "total": 0}
 
 
+def _tag_rows(lib):
+    db = lib["db"]()
+    try:
+        return sorted((r.tag, r.image_id) for r in db.query(GalleryImageTag).all())
+    finally:
+        db.close()
+
+
+def _photo(db, image_id="p1", **fields):
+    row = GalleryImage(id=image_id, filename=f"{image_id}.jpg", prompt=fields.pop("prompt", "x"),
+                       owner=fields.pop("owner", "alice"), is_active=True, **fields)
+    db.add(row)
+    db.commit()
+    return row
+
+
+def test_the_tag_index_follows_every_change_to_a_photo(lib):
+    db = lib["db"]()
+    row = _photo(db, tags="Beach, sunset", ai_tags=" beach ,blue sky")
+    assert _tag_rows(lib) == [("beach", "p1"), ("blue sky", "p1"), ("sunset", "p1")]   # one row per tag
+
+    row.ai_tags = "forest"
+    db.commit()
+    assert _tag_rows(lib) == [("beach", "p1"), ("forest", "p1"), ("sunset", "p1")]
+
+    row.tags = ""
+    db.commit()
+    assert _tag_rows(lib) == [("forest", "p1")]
+
+    db.query(GalleryImage).filter(GalleryImage.id == "p1").update({"ai_tags": "lake"}, synchronize_session=False)
+    db.commit()
+    assert _tag_rows(lib) == [("lake", "p1")]
+
+    db.query(GalleryImage).filter(GalleryImage.id == "p1").delete(synchronize_session=False)
+    db.commit()
+    db.close()
+    assert _tag_rows(lib) == []
+
+
+def test_tags_with_quotes_and_backslashes_cannot_break_the_tag_index(lib):
+    db = lib["db"]()
+    row = _photo(db, ai_tags='say "cheese", back\\slash, it\'s, [x]')
+    assert [tag for tag, _ in _tag_rows(lib)] == sorted(['say "cheese"', "back\\slash", "it's", "[x]"])
+
+    row.ai_tags = ""
+    db.commit()
+    db.close()
+    assert _tag_rows(lib) == []
+
+
+def test_tag_filters_and_search_keep_their_meaning(lib):
+    db = lib["db"]()
+    _photo(db, "a", ai_tags="young man, sandy beach", prompt="IMG_1.jpg")
+    _photo(db, "b", ai_tags="woman, forest", prompt="IMG_2.jpg")
+    _photo(db, "c", tags="Man", prompt="strandurlaub.jpg")
+    _photo(db, "other", owner="bob", ai_tags="man, beach")
+    db.close()
+
+    def found(**params):
+        body = lib["client"].get("/api/gallery/library", params=params).json()
+        assert body["total"] == len(body["items"])
+        return sorted(i["id"] for i in body["items"])
+
+    assert found(exact_tag="man") == ["c"]
+    assert found(tag="man") == ["a", "b", "c"]            # the tag pills match part of a tag
+    assert found(tag="man,forest") == ["b"]               # several pills narrow it down
+    assert found(search="MAN") == ["a", "b", "c"]
+    assert found(search="young beach") == ["a"]           # every word must match, in any tag
+    assert found(search="strand") == ["c"]                # the file name counts too
+    assert found(search="beach,") == ["a"]                # a stray comma does not hide the tag
+    assert found(search="%") == [] and found(tag="_") == []
+
+
+def test_only_the_first_page_counts_the_tagged_photos(lib):
+    db = lib["db"]()
+    _photo(db, "a", ai_tags="beach")
+    _photo(db, "b", ai_tags="")
+    db.close()
+
+    client = lib["client"]
+    assert client.get("/api/gallery/library", params={"limit": 1}).json()["total_tagged"] == 1
+    assert "total_tagged" not in client.get("/api/gallery/library", params={"limit": 1, "offset": 1}).json()
+
+
+def test_tag_counts_are_reused_until_a_photo_changes(lib, monkeypatch):
+    from routes.gallery import tag_stats
+
+    db = lib["db"]()
+    row = _photo(db, ai_tags="beach")
+    builds = []
+    real_build = tag_stats._build
+    monkeypatch.setattr(tag_stats, "_build", lambda *args: builds.append(1) or real_build(*args))
+
+    def counts():
+        return {t["tag"]: t["count"] for t in lib["client"].get("/api/gallery/tag-counts").json()["tags"]}
+
+    assert counts() == {"beach": 1} and counts() == {"beach": 1}
+    assert len(builds) == 1
+
+    row.ai_tags = "beach, lake"
+    db.commit()
+    assert counts() == {"beach": 1, "lake": 1}
+
+    row.is_active = False        # hiding a photo takes it out of the counts
+    db.commit()
+    assert counts() == {}
+
+    db.delete(row)
+    db.commit()
+    db.close()
+    assert counts() == {}
+    assert len(builds) == 4
+
+
+def test_a_repaired_photo_is_picked_up_even_with_the_same_size_and_date(lib):
+    photo = lib["root"] / "2006" / "later.jpg"
+    good = photo.read_bytes()
+    stamp = photo.stat().st_mtime
+    photo.write_bytes(b"\x00" * len(good))
+    os.utime(photo, (stamp, stamp))
+    source_id = _add_source(lib, path=HOST_ROOT).json()["source"]["id"]
+
+    first = _scan(lib, source_id)
+    assert (first["errors"], first["unreadable"]) == (1, 1)
+    second = _scan(lib, source_id)
+    assert (second["errors"], second["unreadable"]) == (0, 1)   # known, so not reported again
+
+    photo.write_bytes(good)
+    os.utime(photo, (stamp, stamp))
+    repaired = _scan(lib, source_id)
+
+    assert (repaired["new"], repaired["errors"], repaired["unreadable"]) == (1, 0, 0)
+
+
+def test_a_removed_photo_shows_in_the_tag_counts_without_a_login(lib, monkeypatch):
+    # With auth off there is no owner filter, so the change check has to count rows on its own.
+    from routes.gallery import gallery_helpers, tag_stats
+
+    monkeypatch.setattr(gallery_helpers, "_auth_disabled", lambda: True)
+    db = lib["db"]()
+    _photo(db, "a", owner=None, ai_tags="beach")
+    _photo(db, "b", owner=None, ai_tags="beach")
+    assert tag_stats.current(lib["db"], None).counts == {"beach": 2}
+
+    db.query(GalleryImage).filter(GalleryImage.id == "b").delete(synchronize_session=False)
+    db.commit()
+    db.close()
+
+    assert tag_stats.current(lib["db"], None).counts == {"beach": 1}
+
+
+def test_the_migration_fills_the_tag_index_of_an_existing_database(lib, monkeypatch, tmp_path):
+    import sqlite3
+
+    db = lib["db"]()
+    _photo(db, tags="own", ai_tags="beach, Blue Sky")
+    _photo(db, "p2", ai_tags='say "hi"')
+    db.close()
+    path = tmp_path / "app.db"
+    conn = sqlite3.connect(path)
+    conn.execute("DROP TRIGGER gallery_images_tags_ai")
+    conn.execute("DROP INDEX ix_gallery_images_browse")
+    conn.execute("DELETE FROM gallery_image_tags")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(core_db, "DATABASE_URL", f"sqlite:///{path}")
+    core_db._migrate_gallery_tag_index()
+
+    assert _tag_rows(lib) == [("beach", "p1"), ("blue sky", "p1"), ("own", "p1"), ('say "hi"', "p2")]
+    db = lib["db"]()
+    _photo(db, "p3", ai_tags="new")     # the trigger is back too
+    db.close()
+    assert ("new", "p3") in _tag_rows(lib)
+    conn = sqlite3.connect(path)
+    assert conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'ix_gallery_images_browse'").fetchone()
+    conn.close()
+
+
+def test_searches_use_the_indexes_instead_of_reading_every_photo(lib):
+    from sqlalchemy import text as sql
+
+    db = lib["db"]()
+
+    def plan(statement):
+        return " ".join(row[3] for row in db.execute(sql("EXPLAIN QUERY PLAN " + statement)))
+
+    active = "gallery_images.is_active = 1 AND gallery_images.owner = 'alice'"
+    page = ("SELECT * FROM gallery_images WHERE " + active +
+            " ORDER BY coalesce(gallery_images.taken_at, gallery_images.created_at) DESC,"
+            " gallery_images.source_relpath DESC LIMIT 60")
+    assert "ix_gallery_images_browse" in plan(page) and "TEMP B-TREE" not in plan(page)
+    assert "ix_gallery_images_ai_tagged" in plan(
+        "SELECT count(*) FROM gallery_images WHERE " + active +
+        " AND gallery_images.ai_tags IS NOT NULL AND gallery_images.ai_tags != ''")
+    assert "COVERING INDEX ix_gallery_faces_owner_person" in plan(
+        "SELECT person_id, count(id), count(DISTINCT image_id) FROM gallery_faces "
+        "WHERE owner = 'alice' AND ignored != 1 AND person_id IS NOT NULL GROUP BY person_id")
+    db.close()
+
+
+def _albums(lib):
+    return {a["name"]: a for a in lib["client"].get("/api/gallery/albums").json()["albums"]}
+
+
+def _trip_source(lib):
+    """A library of trips, as in a holiday folder: one folder per trip."""
+    root = lib["root"]
+    _jpeg(root / "2016_BadGastein" / "a.jpg")
+    _jpeg(root / "2016_BadGastein" / "Handy" / "b.jpg")
+    _jpeg(root / "2018_Italien_Frankreich" / "c.jpg")
+    _jpeg(root / "loose.jpg")
+    source_id = _add_source(lib, path=HOST_ROOT).json()["source"]["id"]
+    _scan(lib, source_id)
+    return source_id
+
+
+def _turn_on_albums(lib, source_id):
+    return lib["client"].patch(f"/api/gallery/sources/{source_id}", json={"sync": {"albums": True}})
+
+
+def test_album_names_read_like_titles():
+    from src.gallery_library.albums import album_name
+
+    assert album_name("2016_BadGastein") == "Bad Gastein 2016"
+    assert album_name("2016_BadGasteinHapimag") == "Bad Gastein Hapimag 2016"
+    assert album_name("2018_Italien_Frankreich") == "Italien Frankreich 2018"
+    assert album_name("2025_Ägypten") == "Ägypten 2025"
+    assert album_name("Schöne_Blumen") == "Schöne Blumen"
+    assert album_name("2023") == "2023"
+
+
+def test_folder_albums_are_off_unless_asked_for(lib, fake_index):
+    from src.gallery_library import jobs
+
+    source_id = _trip_source(lib)
+    jobs.run_now(source_id, embed=False, wait_seconds=1)
+    assert _albums(lib) == {}
+
+
+def test_turning_on_folder_albums_files_every_photo_by_top_folder(lib):
+    source_id = _trip_source(lib)
+    assert _turn_on_albums(lib, source_id).status_code == 200
+
+    albums = _albums(lib)
+    assert albums["Bad Gastein 2016"]["count"] == 2    # subfolders count towards the trip
+    assert albums["Italien Frankreich 2018"]["count"] == 1
+    assert "loose" not in " ".join(albums)             # a photo in the root belongs to no trip
+    in_album = lib["client"].get("/api/gallery/library", params={"album": albums["Bad Gastein 2016"]["id"]}).json()
+    assert in_album["total"] == 2
+
+
+def test_folder_albums_list_the_newest_trip_first_after_hand_made_ones(lib):
+    source_id = _trip_source(lib)
+    _turn_on_albums(lib, source_id)
+    db = lib["db"]()
+    db.add(GalleryAlbum(id="mine", name="Favourites", owner="alice"))
+    db.commit()
+    db.close()
+
+    names = [a["name"] for a in lib["client"].get("/api/gallery/albums").json()["albums"]]
+    assert names[0] == "Favourites"
+    assert names.index("Italien Frankreich 2018") < names.index("Bad Gastein 2016")
+
+
+def test_the_nightly_scan_keeps_folder_albums_up_to_date(lib, fake_index):
+    from src.gallery_library import jobs
+
+    source_id = _trip_source(lib)
+    _turn_on_albums(lib, source_id)
+    _jpeg(lib["root"] / "2016_BadGastein" / "new.jpg")
+    _jpeg(lib["root"] / "2026_Japan" / "tokyo.jpg")
+
+    result = jobs.run_now(source_id, embed=False, wait_seconds=1)
+
+    assert result["result"]["albums"] == {"created": 1, "added": 2, "removed": 0}
+    albums = _albums(lib)
+    assert albums["Bad Gastein 2016"]["count"] == 3 and albums["Japan 2026"]["count"] == 1
+
+
+def test_a_renamed_album_and_a_photo_filed_elsewhere_are_left_alone(lib):
+    from src.gallery_library.albums import sync_albums
+
+    source_id = _trip_source(lib)
+    _turn_on_albums(lib, source_id)
+    client = lib["client"]
+    album = _albums(lib)["Bad Gastein 2016"]
+    client.put(f"/api/gallery/albums/{album['id']}", json={"name": "Skiing"})
+    db = lib["db"]()
+    db.add(GalleryAlbum(id="best", name="Best of", owner="alice"))
+    db.flush()
+    db.query(GalleryImage).filter(GalleryImage.source_relpath == "2016_BadGastein/a.jpg").update({"album_id": "best"})
+    db.commit()
+    db.close()
+
+    assert sync_albums(source_id) == {"created": 0, "added": 0, "removed": 0}
+
+    albums = _albums(lib)
+    assert albums["Skiing"]["count"] == 1 and albums["Best of"]["count"] == 1
+
+
+def test_a_deleted_folder_album_stays_deleted_until_albums_are_turned_on_again(lib):
+    from src.gallery_library.albums import sync_albums
+
+    source_id = _trip_source(lib)
+    _turn_on_albums(lib, source_id)
+    client = lib["client"]
+    client.delete(f"/api/gallery/albums/{_albums(lib)['Bad Gastein 2016']['id']}")
+
+    assert sync_albums(source_id)["created"] == 0
+    assert "Bad Gastein 2016" not in _albums(lib)
+
+    client.patch(f"/api/gallery/sources/{source_id}", json={"sync": {"albums": False}})
+    _turn_on_albums(lib, source_id)
+    assert _albums(lib)["Bad Gastein 2016"]["count"] == 2
+
+
+def test_an_album_goes_when_its_folder_is_gone(lib):
+    import shutil
+
+    from src.gallery_library.albums import sync_albums
+
+    source_id = _trip_source(lib)
+    _turn_on_albums(lib, source_id)
+    shutil.rmtree(lib["root"] / "2018_Italien_Frankreich")
+    _scan(lib, source_id)
+
+    assert sync_albums(source_id)["removed"] == 1
+    assert "Italien Frankreich 2018" not in _albums(lib)
+
+
+def test_removing_a_library_folder_removes_its_albums(lib):
+    source_id = _trip_source(lib)
+    _turn_on_albums(lib, source_id)
+
+    lib["client"].delete(f"/api/gallery/sources/{source_id}")
+
+    assert _albums(lib) == {}
+
+
+def test_folder_albums_never_touch_the_source_folder(lib):
+    before = _snapshot(lib["root"])
+    source_id = _trip_source(lib)
+    after_scan = _snapshot(lib["root"])
+    _turn_on_albums(lib, source_id)
+    assert _snapshot(lib["root"]) == after_scan and len(after_scan) > len(before)
+
+
 def test_background_job_scans_and_reports(lib):
     from src.gallery_library import jobs
     source_id = _add_source(lib, path=HOST_ROOT, include_paths=["2005"]).json()["source"]["id"]
@@ -653,13 +1001,14 @@ def test_adding_a_subfolder_keeps_existing_photos_and_tags(lib):
 def test_scan_choices_are_remembered_for_the_index_task(lib, fake_index):
     client = lib["client"]
     source = _add_source(lib, path=HOST_ROOT, include_paths=["2005"]).json()["source"]
-    assert source["sync"] == {"embed": True, "tag": False, "faces": False}
+    assert source["sync"] == {"embed": True, "tag": False, "faces": False, "albums": False}
     patched = client.patch(f"/api/gallery/sources/{source['id']}", json={"sync": {"tag": True, "interval_minutes": 5}})
-    assert patched.json()["source"]["sync"] == {"embed": True, "tag": True, "faces": False}   # unknown keys dropped
+    assert patched.json()["source"]["sync"] == {
+        "embed": True, "tag": True, "faces": False, "albums": False}   # unknown keys dropped
     client.post(f"/api/gallery/sources/{source['id']}/scan", json={"embed": False, "tag": True})
     _wait_for_job()
     listed = client.get("/api/gallery/sources").json()
-    assert listed["sources"][0]["sync"] == {"embed": False, "tag": True, "faces": False}
+    assert listed["sources"][0]["sync"] == {"embed": False, "tag": True, "faces": False, "albums": False}
     assert listed["index_task"] is None   # no scheduled task seeded in this test
 
 

@@ -4,6 +4,7 @@ Nothing here writes to a source folder. Removing a source or hiding a photo
 only drops Odysseus's own index rows, thumbnails and vectors.
 """
 
+import asyncio
 import logging
 import os
 import uuid
@@ -14,11 +15,12 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from sqlalchemy import case, func
 
-from core.database import GalleryImage, GalleryLibrarySource, SessionLocal
+from core.database import GalleryAlbum, GalleryImage, GalleryLibrarySource, SessionLocal
 from core.middleware import require_admin
 from routes.gallery.gallery_helpers import _owner_filter
 from src.auth_helpers import get_current_user
 from src.gallery_library import embeddings, jobs
+from src.gallery_library.albums import sync_albums
 from src.gallery_library.files import (
     library_file_path,
     mime_type,
@@ -169,9 +171,16 @@ def register_library_routes(router: APIRouter) -> None:
                     raise HTTPException(400, str(exc))
             if "enabled" in body:
                 src.enabled = bool(body.get("enabled"))
+            albums_turned_on = False
             if "sync" in body:
-                src.sync_settings = normalize_sync_settings(body.get("sync"), base=sync_settings(src))
+                before = sync_settings(src)
+                src.sync_settings = normalize_sync_settings(body.get("sync"), base=before)
+                albums_turned_on = src.sync_settings["albums"] and not before["albums"]
+                if albums_turned_on:
+                    src.album_skip = []   # asking for albums again brings deleted ones back
             db.commit()
+            if albums_turned_on:
+                await asyncio.to_thread(sync_albums, src.id)
             return {"ok": True, "source": _source_dict(src, _counts(db, user).get(src.id, {}))}
         finally:
             db.close()
@@ -193,6 +202,7 @@ def register_library_routes(router: APIRouter) -> None:
             from src.gallery_faces.index import delete_faces_of_images
             delete_faces_of_images(db, ids)
             db.query(GalleryImage).filter(GalleryImage.source_id == src.id).delete(synchronize_session=False)
+            db.query(GalleryAlbum).filter(GalleryAlbum.source_id == src.id).delete(synchronize_session=False)
             db.delete(src)
             db.commit()
             return {"ok": True, "removed_photos": len(ids)}
@@ -214,7 +224,7 @@ def register_library_routes(router: APIRouter) -> None:
                 raise HTTPException(400, "This library folder is disabled")
             # The Scan choices become the folder's auto-sync choices.
             settings = normalize_sync_settings(
-                {k: body[k] for k in ("embed", "tag", "faces") if k in body}, base=sync_settings(src))
+                {k: body[k] for k in ("embed", "tag", "faces", "albums") if k in body}, base=sync_settings(src))
             src.sync_settings = settings
             db.commit()
         finally:
