@@ -9,11 +9,24 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 
 from pydantic import BaseModel
+from sqlalchemy import case, func
 
 from core.database import GalleryImage
 from src.auth_helpers import _auth_disabled
 
 logger = logging.getLogger(__name__)
+
+# When a photo was taken: its EXIF date, else when it arrived. ix_gallery_images_browse
+# indexes this expression, so a date range on it reads only the photos in that range.
+TAKEN_KEY = func.coalesce(GalleryImage.taken_at, GalleryImage.created_at)
+
+# Newest and oldest first. created_at of a library photo is only when it was indexed, so those
+# go by the date taken. Uploads and generated images go by when they arrived, which keeps a
+# fresh upload on top even if the photo is old. ix_gallery_images_newest indexes this expression.
+NEWEST_KEY = case(
+    (GalleryImage.source_id.isnot(None), func.coalesce(GalleryImage.taken_at, GalleryImage.created_at)),
+    else_=GalleryImage.created_at,
+)
 
 
 # ---- Request schemas ----

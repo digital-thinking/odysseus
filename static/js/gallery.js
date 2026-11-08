@@ -226,6 +226,10 @@ async function _fetchLibrary(append) {
   if (_activeExactTag) params.set('exact_tag', _activeExactTag);
   if (_activeSimilar) params.set('similar_to', _activeSimilar.id);
   if (_activeNear) params.set('near', `${_activeNear.lat},${_activeNear.lng}`);
+  if (_activeDates) {
+    params.set('since', _activeDates.since);
+    params.set('until', _activeDates.until);
+  }
   if (_activeFolder) {
     params.set('source', _activeFolder.source);
     if (_activeFolder.path) params.set('folder', _activeFolder.path);
@@ -256,7 +260,7 @@ async function _fetchLibrary(append) {
     // Cache an "empty" verdict so the next open of an empty gallery doesn't
     // flash skeleton tiles before the real "No photos yet" message.
     try {
-      const _noFilters = !_search && !_activeTags.length && !_activeModel && !_activeAlbum && !_favoritesOnly && !_activeFolder && !_activePeople.length && !_activeExactTag && !_activeSimilar && !_activeNear;
+      const _noFilters = !_search && !_activeTags.length && !_activeModel && !_activeAlbum && !_favoritesOnly && !_activeFolder && !_activePeople.length && !_activeExactTag && !_activeSimilar && !_activeNear && !_activeDates;
       if (_noFilters) {
         if (_items.length === 0) localStorage.setItem('gallery-known-empty', '1');
         else localStorage.removeItem('gallery-known-empty');
@@ -925,6 +929,7 @@ let _activePeople = [];       // [{ id, name }] — Photos filter: photos showin
 let _activeSimilar = null;     // { id, label } — Photos ranked by how much they look like this one
 let _activeExactTag = null;    // whole tag picked in the Tags tab — Photos filter
 let _activeNear = null;        // { lat, lng, label } — Photos with a location, nearest to this spot first
+let _activeDates = null;       // { since, until, label, icon } — Photos taken in this time (a trip, a day)
 let _peopleView = null;       // null = all people, { type: 'person', id } or { type: 'unknown' }
 let _faceOverlayCleanup = null;
 const _FACES_PAGE = 200;
@@ -941,6 +946,7 @@ function _resetPhotoFilters() {
   _activeExactTag = null;
   _activeSimilar = null;
   _activeNear = null;
+  _activeDates = null;
   const searchInput = document.getElementById('gallery-search');
   const modelSel = document.getElementById('gallery-model-filter');
   const folderSel = document.getElementById('gallery-folder-filter');
@@ -1866,6 +1872,226 @@ function _wireMapSearch(c) {
   c.addEventListener('click', (e) => { if (!e.target.closest('.gallery-map-search')) list.hidden = true; });
 }
 
+// ---- Trips tab and "On this day" ----
+// The server finds trips in where photos were taken (and, before phones
+// recorded that, in folder albums spanning a few weeks). Opening a trip or a
+// day shows Photos taken in that time: the `since` / `until` filter.
+
+let _tripsData = null;        // { trips } — kept while the gallery is open, refreshed on each visit
+let _tripsSeq = 0;
+let _tripsShowVisits = false;
+let _memories = null;         // { date, years } — "On this day" for _memories.date
+
+function _localIsoDate(d = new Date()) {
+  const two = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())}`;
+}
+
+// The server sends local times with microseconds; Date only parses up to seconds everywhere.
+function _localDate(iso) { return new Date(String(iso).slice(0, 19)); }
+
+let _regionNames = null;
+function _countryName(code) {
+  try {
+    _regionNames = _regionNames || new Intl.DisplayNames([navigator.language || 'en'], { type: 'region' });
+    return _regionNames.of(code) || code;
+  } catch (_) { return code; }
+}
+
+function _tripTitle(t) {
+  if (t.album) return t.album.name;
+  const abroad = (t.countries || []).filter(c => c && c !== t.home_country);
+  if (abroad.length) return abroad.map(_countryName).join(' & ');
+  return t.main_place || 'Trip';
+}
+
+// "12–18 Aug 2025". `until` is exclusive, so the last day is the moment before it.
+function _dateRangeText(since, until) {
+  const first = _localDate(since);
+  const last = new Date(_localDate(until).getTime() - 1);
+  const fmt = new Intl.DateTimeFormat(undefined, { day: 'numeric', month: 'short', year: 'numeric' });
+  try { return fmt.formatRange(first, last); } catch (_) { return `${fmt.format(first)} – ${fmt.format(last)}`; }
+}
+
+function _plural(n, word) { return `${Number(n).toLocaleString()} ${word}${n === 1 ? '' : 's'}`; }
+
+// Trips and days read best in the order they happened.
+function _setChronological() {
+  _sort = 'taken_asc';
+  const sel = document.getElementById('gallery-sort');
+  if (sel) sel.value = _sort;
+}
+
+function _openTrip(t) {
+  const label = _tripTitle(t);
+  return _showPhotosFiltered(() => {
+    _setChronological();
+    if (t.kind === 'album' && t.album) _activeAlbum = t.album.id;
+    else _activeDates = { since: t.start, until: t.end, label, icon: '🧳' };
+  });
+}
+
+function _tripsShown() {
+  const all = _tripsData?.trips || [];
+  return _tripsShowVisits ? all : all.filter(t => !t.regular);
+}
+
+function _tripCard(t, index) {
+  const covers = t.covers || [];
+  // The first photo of a trip is often the airport; lead with one from the middle.
+  const pics = covers.length >= 4 ? covers.slice(1, 4) : covers.slice(0, 3);
+  const meta = [_plural(t.photos, 'photo')];
+  if (t.far_km) meta.push(`${_formatDistance(t.far_km)} from home`);
+  return `
+    <button type="button" class="gallery-trip-card" data-trip="${index}" title="Show the photos of this trip">
+      <span class="gallery-trip-covers gallery-trip-covers-${pics.length}">${pics.map(u => `<img src="${_esc(u)}" alt="" loading="lazy">`).join('')}</span>
+      <span class="gallery-trip-info">
+        <span class="gallery-trip-title">${_esc(_tripTitle(t))}</span>
+        <span class="gallery-trip-when">${_esc(_dateRangeText(t.start, t.end))} · ${_plural(t.days, 'day')}</span>
+        ${t.places?.length ? `<span class="gallery-trip-places">${t.places.map(_esc).join(' · ')}</span>` : ''}
+        <span class="gallery-trip-meta">${_esc(meta.join(' · '))}</span>
+      </span>
+    </button>`;
+}
+
+function _drawTrips(c) {
+  const all = _tripsData?.trips || [];
+  if (!all.length) {
+    c.innerHTML = `<div class="gallery-people-empty">No trips yet. A trip is a few days with photos taken more than 50 km from home, so photos need a location — or a library folder album of a few weeks.</div>`;
+    return;
+  }
+  const visits = all.filter(t => t.regular);
+  const shown = _tripsShown();
+  const often = [...new Set(visits.map(t => t.main_place))].slice(0, 3).join(', ');
+  let html = `
+    <div class="gallery-people-head">
+      <span class="gallery-people-summary">${_plural(shown.length, 'trip')}</span>
+      ${visits.length ? `<label class="gallery-trips-visits" title="Places you go to again and again, like ${_esc(often)}">
+        <input type="checkbox" id="gallery-trips-visits"${_tripsShowVisits ? ' checked' : ''}> Also show ${_plural(visits.length, 'visit')} to places you go often</label>` : ''}
+    </div>
+    <p class="gallery-people-hint">Found from where your photos were taken; before that, from library folder albums that span a few weeks.</p>`;
+  let year = null;
+  shown.forEach((t, i) => {
+    const y = String(t.start).slice(0, 4);
+    if (y !== year) {
+      if (year !== null) html += '</div>';
+      year = y;
+      html += `<h3 class="gallery-trips-year">${_esc(y)}</h3><div class="gallery-trips-grid">`;
+    }
+    html += _tripCard(t, i);
+  });
+  c.innerHTML = html + (year !== null ? '</div>' : '');
+}
+
+async function _renderTripsTab() {
+  const c = document.getElementById('gallery-trips-container');
+  if (!c) return;
+  if (!c.dataset.wired) {
+    c.dataset.wired = '1';
+    c.addEventListener('click', (e) => {
+      const card = e.target.closest('.gallery-trip-card');
+      const trip = card && _tripsShown()[Number(card.dataset.trip)];
+      if (trip) _openTrip(trip);
+    });
+    c.addEventListener('change', (e) => {
+      if (e.target.id !== 'gallery-trips-visits') return;
+      _tripsShowVisits = e.target.checked;
+      _drawTrips(c);
+    });
+  }
+  if (_tripsData) _drawTrips(c);
+  else c.innerHTML = '<div class="gallery-people-empty">Looking for trips…</div>';
+  const seq = ++_tripsSeq;
+  try {
+    const data = await _jsonFetch('/api/gallery/trips');
+    if (seq !== _tripsSeq) return;
+    const changed = JSON.stringify(data) !== JSON.stringify(_tripsData);
+    _tripsData = data;
+    if (changed) _drawTrips(c);
+  } catch (err) {
+    if (seq === _tripsSeq && !_tripsData) {
+      c.innerHTML = `<div class="gallery-people-empty">Could not load trips: ${_esc(err.message)}</div>`;
+    }
+  }
+}
+
+function _memoriesHiddenToday() {
+  try { return localStorage.getItem('gallery-memories-hidden') === _localIsoDate(); } catch (_) { return false; }
+}
+
+async function _loadMemories() {
+  const today = _localIsoDate();
+  if (_memories && _memories.date !== today) _memories = null;
+  _renderMemories();
+  try {
+    _memories = await _jsonFetch(`/api/gallery/on-this-day?date=${today}`);
+  } catch (_) {
+    return;   // a nice extra; the gallery works without it
+  }
+  _renderMemories();
+}
+
+// The strip above the grid: one card per earlier year with photos from today's date.
+function _renderMemories() {
+  const el = document.getElementById('gallery-memories');
+  if (!el) return;
+  const years = _memories?.years || [];
+  const filtered = _search || _activeTags.length || _activeModel || _activeAlbum || _favoritesOnly || _activeFolder
+    || _activePeople.length || _activeExactTag || _activeSimilar || _activeNear || _activeDates;
+  if (!years.length || filtered || _memoriesHiddenToday()) {
+    el.hidden = true;
+    return;
+  }
+  const key = `${_memories.date}|${years.map(y => `${y.year}:${y.count}:${y.items[0]?.id || ''}`).join(',')}`;
+  if (el.dataset.key !== key) {
+    el.dataset.key = key;
+    const day = new Date(`${_memories.date}T12:00:00`).toLocaleDateString(undefined, { day: 'numeric', month: 'long' });
+    el.innerHTML = `
+      <div class="gallery-memories-head">
+        <span class="gallery-memories-title">On this day</span>
+        <span class="gallery-memories-date">${_esc(day)}</span>
+        <button type="button" class="gallery-memories-close" title="Hide until tomorrow" aria-label="Hide On this day until tomorrow">&times;</button>
+      </div>
+      <div class="gallery-memories-row">${years.map(y => {
+        const cover = y.items[Math.floor(y.items.length / 2)];
+        return `
+          <button type="button" class="gallery-memory-card" data-year="${y.year}" title="Show the photos taken on ${_esc(day)} ${y.year}">
+            ${cover ? `<img src="${_esc(cover.thumb_url || cover.url)}" alt="" loading="lazy">` : ''}
+            <span class="gallery-memory-label">
+              <strong>${_plural(y.years_ago, 'year')} ago</strong>
+              <span>${y.year} · ${_plural(y.count, 'photo')}</span>
+            </span>
+          </button>`;
+      }).join('')}</div>`;
+  }
+  if (!el.dataset.wired) {
+    el.dataset.wired = '1';
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('.gallery-memories-close')) {
+        try { localStorage.setItem('gallery-memories-hidden', _localIsoDate()); } catch (_) {}
+        el.hidden = true;
+        return;
+      }
+      const card = e.target.closest('.gallery-memory-card');
+      if (!card || !_memories) return;
+      const [, month, dayOfMonth] = _memories.date.split('-').map(Number);
+      const year = Number(card.dataset.year);
+      const first = new Date(year, month - 1, dayOfMonth);
+      const next = new Date(year, month - 1, dayOfMonth + 1);
+      _showPhotosFiltered(() => {
+        _setChronological();
+        _activeDates = {
+          since: _localIsoDate(first),
+          until: _localIsoDate(next),
+          label: first.toLocaleDateString(undefined, { day: 'numeric', month: 'short', year: 'numeric' }),
+          icon: '📅',
+        };
+      });
+    });
+  }
+  el.hidden = false;
+}
+
 function _renderAlbums() {
   const container = document.getElementById('gallery-album-chips');   // above search: active-filter indicators
   const filterC = document.getElementById('gallery-filter-chips');    // below search: All / Favorites
@@ -1885,6 +2111,7 @@ function _renderAlbums() {
     _activePeople.forEach(p => { fhtml += _filterPill('Person', p.name, `data-clear-person="${_esc(p.id)}"`); });
     if (_activeSimilar) fhtml += _filterPill('Similar', `Similar to ${_activeSimilar.label}`, 'data-clear="similar"');
     if (_activeNear) fhtml += _filterPill('Near', `📍 Nearest to ${_activeNear.label}`, 'data-clear="near"');
+    if (_activeDates) fhtml += _filterPill('Taken', `${_activeDates.icon || '📅'} ${_activeDates.label}`, 'data-clear="dates"');
     if (_activeExactTag) fhtml += _filterPill('Tag', `#${_activeExactTag}`, 'data-clear="exact-tag"');
     if (_activeModel) fhtml += _filterPill('Source', _activeModel, 'data-clear="model"');
     _activeTags.forEach(t => {
@@ -1896,7 +2123,7 @@ function _renderAlbums() {
         fhtml += _filterPill('Album', a.name, 'data-clear="album"');
       }
     }
-    if (_search || _activeTags.length || _activeModel || _activeAlbum || _favoritesOnly || _activeFolder || _activePeople.length || _activeExactTag || _activeSimilar || _activeNear) {
+    if (_search || _activeTags.length || _activeModel || _activeAlbum || _favoritesOnly || _activeFolder || _activePeople.length || _activeExactTag || _activeSimilar || _activeNear || _activeDates) {
       fhtml += `<button class="gallery-chip gallery-clear-all-filters" data-clear="all" title="Clear every gallery filter">Clear all</button>`;
     }
     filterC.innerHTML = fhtml;
@@ -1954,6 +2181,12 @@ function _renderAlbums() {
       _fetchLibrary(false);
       _renderAlbums();
     });
+    filterC.querySelector('.gallery-chip-clear[data-clear="dates"]')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _activeDates = null;
+      _fetchLibrary(false);
+      _renderAlbums();
+    });
     filterC.querySelector('.gallery-chip-clear[data-clear="folder"]')?.addEventListener('click', (e) => {
       e.stopPropagation();
       _setFolderFilter('');
@@ -1985,6 +2218,7 @@ function _renderAlbums() {
   // The above-search row is no longer used — all filter chips live below now.
   if (container) container.innerHTML = '';
   _syncSortSelect();
+  _renderMemories();
 }
 
 // "Nearest to …" orders by distance, so the sort menu shows that and waits.
@@ -3765,6 +3999,10 @@ export function openGallery() {
           <span class="gallery-tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></svg></span>
           <span class="gallery-tab-label">Map</span>
         </button>
+        <button class="gallery-tab" data-tab="trips">
+          <span class="gallery-tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="7" width="18" height="13" rx="2"/><path d="M8 7V5a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="8" y1="11" x2="8" y2="16"/><line x1="16" y1="11" x2="16" y2="16"/></svg></span>
+          <span class="gallery-tab-label">Trips</span>
+        </button>
         <button class="gallery-tab" data-tab="albums">
           <span class="gallery-tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>
           <span class="gallery-tab-label">Albums</span>
@@ -3820,6 +4058,7 @@ export function openGallery() {
           <button class="memory-toolbar-btn" id="gallery-bulk-cancel" title="Cancel (Esc)" style="margin-left:4px;padding:3px 6px;position:relative;top:-3px;"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
         </div>
         <div class="gallery-tag-chips" id="gallery-tag-chips"></div>
+        <div class="gallery-memories" id="gallery-memories" hidden></div>
         <div class="gallery-grid" id="gallery-grid"></div>
         <button class="gallery-load-more" id="gallery-load-more" style="display:none">Load more</button>
         <div class="gallery-detail" id="gallery-detail" style="display:none"></div>
@@ -3828,6 +4067,7 @@ export function openGallery() {
         <div class="gallery-people-container" id="gallery-people-container" style="display:none;"></div>
         <div class="gallery-people-container gallery-tags-container" id="gallery-tags-container" style="display:none;"></div>
         <div class="gallery-map-container" id="gallery-map-container" style="display:none;"></div>
+        <div class="gallery-people-container gallery-trips-container" id="gallery-trips-container" style="display:none;"></div>
         <div class="gallery-editor-container" id="gallery-editor-container" style="display:none;"></div>
         <div class="gallery-settings-container" id="gallery-settings-container" style="display:none;">
           <div class="admin-card" id="gallery-library-card" style="display:none;">
@@ -3996,6 +4236,8 @@ export function openGallery() {
       if (tagsContainer) tagsContainer.style.display = target === 'tags' ? '' : 'none';
       const mapContainer = document.getElementById('gallery-map-container');
       if (mapContainer) mapContainer.style.display = target === 'map' ? '' : 'none';
+      const tripsContainer = document.getElementById('gallery-trips-container');
+      if (tripsContainer) tripsContainer.style.display = target === 'trips' ? '' : 'none';
       if (editorContainer) editorContainer.style.display = target === 'editor' ? 'flex' : 'none';
       if (settingsContainer) settingsContainer.style.display = target === 'settings' ? '' : 'none';
       if (target === 'images') {
@@ -4010,6 +4252,8 @@ export function openGallery() {
         _renderTagsTab();
       } else if (target === 'map') {
         _renderMapTab();
+      } else if (target === 'trips') {
+        _renderTripsTab();
       } else if (target === 'settings') {
         _loadLibrarySources();
         _loadTagModelPicker();
@@ -4787,6 +5031,7 @@ export function openGallery() {
   _fetchAlbums();
   _fetchFolders();
   _fetchLibrary(false);
+  _loadMemories();
   // Desktop keeps the convenient type-to-search behavior. On mobile this
   // immediately opened the keyboard and dropped the user into Search before
   // they could browse the drawer.
@@ -4812,6 +5057,8 @@ function _showImagesTab() {
   if (tagsContainer) tagsContainer.style.display = 'none';
   const mapContainer = document.getElementById('gallery-map-container');
   if (mapContainer) mapContainer.style.display = 'none';
+  const tripsContainer = document.getElementById('gallery-trips-container');
+  if (tripsContainer) tripsContainer.style.display = 'none';
 }
 
 export async function openGalleryImage(imageId) {
@@ -4827,6 +5074,7 @@ export async function openGalleryImage(imageId) {
   _activeAlbum = null;
   _favoritesOnly = false;
   _activeNear = null;
+  _activeDates = null;
   _sort = 'recent';
   const searchInput = document.getElementById('gallery-search');
   if (searchInput) searchInput.value = '';

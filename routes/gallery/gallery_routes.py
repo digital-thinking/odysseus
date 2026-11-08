@@ -10,11 +10,12 @@ import logging
 import re
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from sqlalchemy import case, func, or_, select, text
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.orm import aliased
 
 from core.database import (
@@ -34,11 +35,13 @@ from src.path_confinement import confine
 from src.optional_deps import patch_realesrgan_torchvision_compat
 
 from routes.gallery.gallery_helpers import (
-    GalleryPatch, _extract_exif, _image_to_dict, _image_urls, _owner_filter, _human_size,
+    GalleryPatch, NEWEST_KEY as _NEWEST_KEY, TAKEN_KEY, _extract_exif, _image_to_dict, _image_urls,
+    _owner_filter, _human_size,
 )
 from routes.gallery.library_routes import register_library_routes
 from routes.gallery.map_routes import parse_point, rank_by_distance, register_map_routes
 from routes.gallery.people_routes import register_people_routes
+from routes.gallery.trip_routes import register_trip_routes
 from routes.gallery import tag_stats
 from routes.gallery.tag_stats import tag_key as _tag_key
 from src.gallery_library.files import is_library_image, library_file_path, remove_thumbnail
@@ -57,14 +60,6 @@ _SIMILAR_RESULTS = 200   # "Similar photos": how many nearest neighbours to list
 _HAS_USER_TAGS = text("gallery_images.tags IS NOT NULL AND gallery_images.tags != ''")
 _HAS_AI_TAGS = text("gallery_images.ai_tags IS NOT NULL AND gallery_images.ai_tags != ''")
 _MAX_TAGS_PER_FILTER = 2000   # a broader match ("a") is cheaper as a plain text scan
-
-# Newest and oldest first. created_at of a library photo is only when it was indexed, so those
-# go by the date taken. Uploads and generated images go by when they arrived, which keeps a
-# fresh upload on top even if the photo is old. ix_gallery_images_newest indexes this expression.
-_NEWEST_KEY = case(
-    (GalleryImage.source_id.isnot(None), func.coalesce(GalleryImage.taken_at, GalleryImage.created_at)),
-    else_=GalleryImage.created_at,
-)
 
 
 def _uses_tag_table(db) -> bool:
@@ -911,6 +906,7 @@ def setup_gallery_routes() -> APIRouter:
     register_library_routes(router)
     register_people_routes(router)
     register_map_routes(router)
+    register_trip_routes(router)
 
     def _image_file(img, db) -> Path:
         """Original file of any gallery row (library source or generated_images). Read-only use."""
@@ -1283,12 +1279,21 @@ def setup_gallery_routes() -> APIRouter:
         exact_tag: Optional[str] = Query(None),
         similar_to: Optional[str] = Query(None),
         near: Optional[str] = Query(None),
+        since: Optional[str] = Query(None),
+        until: Optional[str] = Query(None),
     ) -> Dict[str, Any]:
         user = get_current_user(request)
         # "lat,lng": only photos with a location, nearest first (other filters still apply).
         origin = parse_point(near) if near else None
         if near and origin is None:
             raise HTTPException(400, "near must be 'latitude,longitude'")
+        # Taken in [since, until): a trip, a day. ISO dates or date-times, local time like EXIF.
+        taken_range = []
+        for name, value in (("since", since), ("until", until)):
+            try:
+                taken_range.append(datetime.fromisoformat(value) if value else None)
+            except ValueError:
+                raise HTTPException(400, f"{name} must be an ISO date like 2024-08-12")
         db = SessionLocal()
         try:
             # Distinct tags for filter UI
@@ -1421,6 +1426,11 @@ def setup_gallery_routes() -> APIRouter:
                     q = q.filter(GalleryImage.source_relpath.like(
                         f"{escape_like_pattern(folder_path)}/%", escape="\\"))
 
+            if taken_range[0] is not None:
+                q = q.filter(TAKEN_KEY >= taken_range[0])   # a range of ix_gallery_images_browse
+            if taken_range[1] is not None:
+                q = q.filter(TAKEN_KEY < taken_range[1])
+
             if origin is not None:
                 q = q.filter(GalleryImage.gps_lat.isnot(None))   # ix_gallery_images_located
 
@@ -1476,7 +1486,7 @@ def setup_gallery_routes() -> APIRouter:
                 rng.shuffle(all_ids)
                 rows = page_rows(all_ids[offset:offset + limit])
             else:
-                taken = func.coalesce(GalleryImage.taken_at, GalleryImage.created_at)
+                taken = TAKEN_KEY
                 q = q.add_columns(DbSession.name).outerjoin(DbSession, GalleryImage.session_id == DbSession.id)
                 if sort == "oldest":
                     q = q.order_by(_NEWEST_KEY.asc(), GalleryImage.source_relpath.asc())

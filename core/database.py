@@ -524,7 +524,7 @@ def _gallery_tags_of(row: str) -> str:
 # 2 KB embedding. These indexes hold what filters, counts and sorting need, so
 # those queries never touch the wide rows. Partial indexes only apply to queries
 # that spell out the same condition with literals (see _HAS_AI_TAGS in the routes).
-# Newest and oldest first. Must stay the same expression as _NEWEST_KEY in the gallery routes.
+# Newest and oldest first. Must stay the same expression as NEWEST_KEY in routes/gallery/gallery_helpers.py.
 _GALLERY_NEWEST = "(CASE WHEN source_id IS NOT NULL THEN coalesce(taken_at, created_at) ELSE created_at END)"
 _GALLERY_IMAGE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_browse ON gallery_images "

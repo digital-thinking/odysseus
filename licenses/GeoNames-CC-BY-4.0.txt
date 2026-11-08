@@ -1,0 +1,13 @@
+GeoNames geographical database
+https://www.geonames.org/
+
+src/gallery_library/geodata/cities5000.tsv.gz is derived from the GeoNames export
+"cities5000" (https://download.geonames.org/export/dump/cities5000.zip): the
+name, position, country code and population of each town with 5,000 or more
+people, without the entries for parts of towns (feature code PPLX).
+
+Data (c) GeoNames, licensed under the Creative Commons Attribution 4.0
+International License (CC BY 4.0): https://creativecommons.org/licenses/by/4.0/
+
+Changes: columns reduced as above, coordinates rounded to three decimals,
+rows sorted by country and name.

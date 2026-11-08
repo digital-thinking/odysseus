@@ -38,6 +38,7 @@ static/lib/leaflet/leaflet.css -text
 *.ico  binary
 *.woff binary
 *.woff2 binary
+*.gz binary
 
 # Notes reference deployment modules.
 static/js/features/notes/** text eol=lf

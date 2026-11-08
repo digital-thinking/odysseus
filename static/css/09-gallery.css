@@ -1627,3 +1627,61 @@ path.gallery-map-hover { stroke: #fff; fill: var(--hl-function); fill-opacity: 0
   .gallery-map-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(300px, 55vh) auto; height: auto; }
   .gallery-map-side { overflow: visible; }
 }
+
+/* ---- Trips ---- */
+.gallery-trips-container { padding: 6px 2px 12px; }
+.gallery-trips-visits { display: inline-flex; align-items: center; gap: 6px; font-size: 11px; opacity: 0.8; cursor: pointer; }
+.gallery-trips-visits input { margin: 0; }
+.gallery-trips-year { font-size: 13px; font-weight: 600; margin: 18px 2px 8px; opacity: 0.85; }
+.gallery-people-hint + .gallery-trips-year { margin-top: 6px; }
+.gallery-trips-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 12px; }
+.gallery-trip-card {
+  display: flex; flex-direction: column; height: auto; padding: 0; min-width: 0;
+  background: var(--panel); color: var(--fg); font: inherit; text-align: left;
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden; cursor: pointer;
+  transition: transform 0.12s, border-color 0.12s, box-shadow 0.12s;
+}
+.gallery-trip-card:hover, .gallery-trip-card:focus-visible {
+  transform: translateY(-2px); border-color: var(--red);
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--fg) 12%, transparent);
+}
+.gallery-trip-covers {
+  display: grid; gap: 2px; width: 100%; aspect-ratio: 16 / 10; overflow: hidden;
+  grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr);
+  background: color-mix(in srgb, var(--fg) 5%, var(--bg));
+}
+.gallery-trip-covers img { display: block; width: 100%; height: 100%; min-height: 0; object-fit: cover; }
+.gallery-trip-covers-2 { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+.gallery-trip-covers-3 { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+.gallery-trip-covers-3 img:first-child { grid-row: span 2; }
+.gallery-trip-info { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px 10px; min-width: 0; }
+.gallery-trip-title { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gallery-trip-when, .gallery-trip-meta { font-size: 11px; opacity: 0.6; }
+.gallery-trip-places { font-size: 11px; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* ---- On this day ---- */
+.gallery-memories { margin: 2px 0 10px; }
+.gallery-memories[hidden] { display: none; }
+.gallery-memories-head { display: flex; align-items: baseline; gap: 8px; margin: 0 2px 6px; }
+.gallery-memories-title { font-size: 12px; font-weight: 600; }
+.gallery-memories-date { font-size: 11px; opacity: 0.6; flex: 1; }
+.gallery-memories-close {
+  height: auto; padding: 0 4px; background: none; border: none; color: var(--fg);
+  font-size: 16px; line-height: 1; opacity: 0.5; cursor: pointer;
+}
+.gallery-memories-close:hover, .gallery-memories-close:focus-visible { opacity: 1; }
+.gallery-memories-row { display: flex; gap: 8px; overflow-x: auto; padding-bottom: 4px; scrollbar-width: thin; }
+.gallery-memory-card {
+  position: relative; flex: 0 0 auto; width: 150px; height: 104px; padding: 0;
+  border: 1px solid var(--border); border-radius: 10px; overflow: hidden; cursor: pointer;
+  background: color-mix(in srgb, var(--fg) 6%, var(--bg)); color: #fff; font: inherit; text-align: left;
+}
+.gallery-memory-card img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: transform 0.25s; }
+.gallery-memory-card:hover img { transform: scale(1.05); }
+.gallery-memory-card:focus-visible { outline: 2px solid var(--red); outline-offset: 2px; }
+.gallery-memory-label {
+  position: absolute; left: 0; right: 0; bottom: 0; padding: 18px 8px 6px;
+  display: flex; flex-direction: column; gap: 1px; font-size: 10px; line-height: 1.25;
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.72), rgba(0, 0, 0, 0));
+}
+.gallery-memory-label strong { font-size: 12px; font-weight: 600; }
