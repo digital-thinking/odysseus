@@ -62,6 +62,25 @@ _HAS_AI_TAGS = text("gallery_images.ai_tags IS NOT NULL AND gallery_images.ai_ta
 _MAX_TAGS_PER_FILTER = 2000   # a broader match ("a") is cheaper as a plain text scan
 
 
+def _photos_per_month(q, sort: str, ranked: bool) -> Dict[str, Any]:
+    """The timeline beside the grid: [["2024-08", photos], ...] in the grid's order.
+
+    Counted in Python from the sort key read along its index: a GROUP BY on the
+    expression makes SQLite read every photo's row (0.6 s instead of 0.1 s).
+    """
+    if ranked or sort not in ("recent", "oldest", "taken_desc", "taken_asc"):
+        return {"months": [], "total": 0}   # by similarity, distance or chance: no dates to jump to
+    key = TAKEN_KEY if sort.startswith("taken_") else _NEWEST_KEY
+    newest_first = sort in ("recent", "taken_desc")
+    counts: Dict[str, int] = {}
+    for (when,) in q.with_entities(key).order_by(key.desc() if newest_first else key.asc()):
+        if when is None:
+            continue
+        month = when[:7] if isinstance(when, str) else f"{when.year:04d}-{when.month:02d}"
+        counts[month] = counts.get(month, 0) + 1
+    return {"months": [[m, n] for m, n in counts.items()], "total": sum(counts.values())}
+
+
 def _uses_tag_table(db) -> bool:
     """gallery_image_tags is kept up to date by SQLite triggers; other databases have none."""
     return db.get_bind().dialect.name == "sqlite"
@@ -1281,6 +1300,7 @@ def setup_gallery_routes() -> APIRouter:
         near: Optional[str] = Query(None),
         since: Optional[str] = Query(None),
         until: Optional[str] = Query(None),
+        months: bool = Query(False),
     ) -> Dict[str, Any]:
         user = get_current_user(request)
         # "lat,lng": only photos with a location, nearest first (other filters still apply).
@@ -1434,6 +1454,9 @@ def setup_gallery_routes() -> APIRouter:
             if origin is not None:
                 q = q.filter(GalleryImage.gps_lat.isnot(None))   # ix_gallery_images_located
 
+            if months:
+                return _photos_per_month(q, sort, ranked_ids is not None or origin is not None)
+
             def page_rows(page_ids):
                 """(photo, session name) of these ids, in this order."""
                 if not page_ids:
@@ -1487,16 +1510,19 @@ def setup_gallery_routes() -> APIRouter:
                 rows = page_rows(all_ids[offset:offset + limit])
             else:
                 taken = TAKEN_KEY
-                q = q.add_columns(DbSession.name).outerjoin(DbSession, GalleryImage.session_id == DbSession.id)
                 if sort == "oldest":
-                    q = q.order_by(_NEWEST_KEY.asc(), GalleryImage.source_relpath.asc())
+                    order = (_NEWEST_KEY.asc(), GalleryImage.source_relpath.asc())
                 elif sort == "taken_desc":
-                    q = q.order_by(taken.desc(), GalleryImage.source_relpath.desc())
+                    order = (taken.desc(), GalleryImage.source_relpath.desc())
                 elif sort == "taken_asc":
-                    q = q.order_by(taken.asc(), GalleryImage.source_relpath.asc())
+                    order = (taken.asc(), GalleryImage.source_relpath.asc())
                 else:  # recent
-                    q = q.order_by(_NEWEST_KEY.desc(), GalleryImage.source_relpath.desc())
-                rows = q.offset(offset).limit(limit).all()
+                    order = (_NEWEST_KEY.desc(), GalleryImage.source_relpath.desc())
+                # The page's ids first, then its rows with their session names: joining
+                # sessions in one query would also join every photo skipped by the offset
+                # (0.4 s for a timeline jump 13,000 photos down instead of 0.06 s).
+                page_ids = q.with_entities(GalleryImage.id).order_by(*order).offset(offset).limit(limit)
+                rows = page_rows([image_id for (image_id,) in page_ids])
 
             items = []
             for img, session_name in rows:

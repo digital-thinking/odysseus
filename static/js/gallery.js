@@ -192,29 +192,9 @@ const _albumSelected = new Set();
 
 let _fetchSeq = 0;   // only the newest request may update the grid
 
-async function _fetchLibrary(append) {
-  const seq = ++_fetchSeq;
-  // Recompute the page size each fetch so resizing / fullscreening the
-  // window between loads pulls the right number of photos.
-  _limit = _computeFetchLimit();
-  // First load with nothing on screen → show skeleton tiles instead of a blank
-  // grid that then snaps to full. BUT: if the last successful load returned
-  // zero items, skip the skeleton entirely — otherwise empty accounts flash
-  // 8-20 placeholder tiles for ~200ms before snapping to the "No photos yet"
-  // message, which read as glitchy.
-  if (!append && _items.length === 0) {
-    let _knownEmpty = false;
-    try { _knownEmpty = localStorage.getItem('gallery-known-empty') === '1'; } catch (_) {}
-    if (!_knownEmpty) _renderSkeletons(_limit);
-  }
-  if (!append) {
-    _offset = 0;
-    // Leave _items untouched until the response arrives — that's the
-    // stale-while-revalidate trick that lets the gallery feel instant on
-    // re-open. The new list replaces _items on success below; if the fetch
-    // fails, the previous photos stay visible.
-  }
-  const params = new URLSearchParams({ sort: _sort, offset: _offset, limit: _limit });
+// The Photos filters and sort as query parameters (paging is added by the caller).
+function _libraryParams() {
+  const params = new URLSearchParams({ sort: _sort });
   if (_sort === 'shuffle') params.set('seed', String(_shuffleSeed));
   if (_search) params.set('search', _search);
   if (_search && _smart) params.set('semantic', 'true');
@@ -234,6 +214,35 @@ async function _fetchLibrary(append) {
     params.set('source', _activeFolder.source);
     if (_activeFolder.path) params.set('folder', _activeFolder.path);
   }
+  return params;
+}
+
+// startAt: show the list from this photo on (a timeline jump); 0 = from the top.
+async function _fetchLibrary(append, startAt = 0) {
+  const seq = ++_fetchSeq;
+  // Recompute the page size each fetch so resizing / fullscreening the
+  // window between loads pulls the right number of photos.
+  _limit = _computeFetchLimit();
+  // First load with nothing on screen → show skeleton tiles instead of a blank
+  // grid that then snaps to full. BUT: if the last successful load returned
+  // zero items, skip the skeleton entirely — otherwise empty accounts flash
+  // 8-20 placeholder tiles for ~200ms before snapping to the "No photos yet"
+  // message, which read as glitchy.
+  if (!append && _items.length === 0) {
+    let _knownEmpty = false;
+    try { _knownEmpty = localStorage.getItem('gallery-known-empty') === '1'; } catch (_) {}
+    if (!_knownEmpty) _renderSkeletons(_limit);
+  }
+  if (!append) {
+    _offset = startAt;
+    // Leave _items untouched until the response arrives — that's the
+    // stale-while-revalidate trick that lets the gallery feel instant on
+    // re-open. The new list replaces _items on success below; if the fetch
+    // fails, the previous photos stay visible.
+  }
+  const params = _libraryParams();
+  params.set('offset', String(_offset));
+  params.set('limit', String(_limit));
   try {
     const res = await fetch(`${API_BASE}/api/gallery/library?${params}`, { credentials: 'same-origin' });
     if (seq !== _fetchSeq) return;   // a newer search / filter has been sent
@@ -256,6 +265,7 @@ async function _fetchLibrary(append) {
       _items = _items.concat(data.items || []);
     } else {
       _items = data.items || [];
+      _baseOffset = startAt;
     }
     // Cache an "empty" verdict so the next open of an empty gallery doesn't
     // flash skeleton tiles before the real "No photos yet" message.
@@ -274,6 +284,8 @@ async function _fetchLibrary(append) {
     _renderModels(data.models || []);
     _renderAlbums();
     _renderStats();
+    if (!append && !startAt) _fetchTimeline();   // a new list: its months
+    else _syncTimelineMarker();
   } catch (e) {
     console.error('Gallery fetch error:', e);
   }
@@ -2092,6 +2104,201 @@ function _renderMemories() {
   el.hidden = false;
 }
 
+// ---- Timeline beside the photo grid ----
+// A rail with the years of the photos in the grid, spaced by how many photos
+// each month holds. Clicking or dragging it jumps there: the grid then starts
+// at that photo (_baseOffset) and loads the newer ones when scrolled back up,
+// so it never has to hold the whole library.
+
+let _baseOffset = 0;          // where _items starts in the full, filtered list
+let _timeline = null;         // { months: [['YYYY-MM', photos]], starts: [offset], total }
+let _timelineSeq = 0;
+let _loadingNewer = false;
+
+async function _fetchTimeline() {
+  const seq = ++_timelineSeq;
+  const params = _libraryParams();
+  let data = { months: [], total: 0 };
+  if (['recent', 'oldest', 'taken_desc', 'taken_asc'].includes(_sort) && !_activeNear && !_activeSimilar && !(_smart && _search)) {
+    params.set('months', 'true');
+    try { data = await _jsonFetch(`/api/gallery/library?${params}`); } catch (_) { /* no rail then */ }
+  }
+  if (seq !== _timelineSeq) return;
+  let at = 0;
+  const months = data.months || [];
+  _timeline = { months, starts: months.map(([, n]) => { const start = at; at += n; return start; }), total: at };
+  _drawTimeline();
+}
+
+function _monthLabel(ym) {
+  const [y, m] = ym.split('-').map(Number);
+  return new Date(y, m - 1, 1).toLocaleDateString(undefined, { month: 'short', year: 'numeric' });
+}
+
+function _drawTimeline() {
+  const rail = document.getElementById('gallery-timeline');
+  if (!rail) return;
+  const t = _timeline;
+  const show = !!t && t.months.length > 1 && t.total > _limit;
+  rail.hidden = !show;
+  if (!show) return;
+  if (!rail.dataset.wired) _wireTimeline(rail);
+  const height = rail.clientHeight || 1;
+  let html = '<span class="gallery-timeline-track"></span>';
+  let lastYear = null;
+  let lastLabelY = -Infinity;
+  t.months.forEach(([ym], i) => {
+    const year = ym.slice(0, 4);
+    if (year === lastYear) return;
+    lastYear = year;
+    const top = (t.starts[i] / t.total) * 100;
+    const y = (top / 100) * height;
+    const labelled = y - lastLabelY >= 15;   // years too close together get a dot
+    if (labelled) lastLabelY = y;
+    html += labelled
+      ? `<span class="gallery-timeline-year" style="top:${top}%">${year}</span>`
+      : `<span class="gallery-timeline-dot" style="top:${top}%"></span>`;
+  });
+  html += '<span class="gallery-timeline-here"></span><span class="gallery-timeline-tip" hidden></span>';
+  rail.innerHTML = html;
+  rail.setAttribute('aria-valuemax', String(t.total));
+  _syncTimelineMarker();
+}
+
+// Index of the month that holds the photo at this offset.
+function _timelineMonthOf(at) {
+  const t = _timeline;
+  let lo = 0, hi = t.months.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1;
+    if (t.starts[mid] <= at) lo = mid; else hi = mid - 1;
+  }
+  return lo;
+}
+
+// Index of the month under a point of the rail.
+function _timelineMonthAt(rail, clientY) {
+  const r = rail.getBoundingClientRect();
+  return _timelineMonthOf(Math.min(_timeline.total - 1, Math.max(0, ((clientY - r.top) / r.height) * _timeline.total)));
+}
+
+function _wireTimeline(rail) {
+  rail.dataset.wired = '1';
+  let dragging = false;
+  const tipAt = (clientY) => {
+    const i = _timelineMonthAt(rail, clientY);
+    const tip = rail.querySelector('.gallery-timeline-tip');
+    if (tip) {
+      tip.hidden = false;
+      tip.textContent = _monthLabel(_timeline.months[i][0]);
+      tip.style.top = `${Math.min(rail.clientHeight, Math.max(0, clientY - rail.getBoundingClientRect().top))}px`;
+    }
+    return i;
+  };
+  rail.addEventListener('pointermove', (e) => { if (_timeline) tipAt(e.clientY); });
+  rail.addEventListener('pointerleave', () => {
+    if (!dragging) rail.querySelector('.gallery-timeline-tip')?.setAttribute('hidden', '');
+  });
+  rail.addEventListener('pointerdown', (e) => {
+    if (!_timeline || e.button !== 0) return;
+    dragging = true;
+    try { rail.setPointerCapture(e.pointerId); } catch (_) { /* keep following the pointer without it */ }
+    tipAt(e.clientY);
+  });
+  const finish = (e) => {
+    if (!dragging) return;
+    dragging = false;
+    const i = tipAt(e.clientY);
+    rail.querySelector('.gallery-timeline-tip')?.setAttribute('hidden', '');
+    _jumpTo(_timeline.starts[i]);
+  };
+  rail.addEventListener('pointerup', finish);
+  rail.addEventListener('pointercancel', () => { dragging = false; });
+  // Keys: a month (arrows) or a year (Page Up / Down) at a time.
+  rail.addEventListener('keydown', (e) => {
+    const t = _timeline;
+    if (!t) return;
+    const step = { ArrowDown: 1, ArrowUp: -1, PageDown: 12, PageUp: -12 }[e.key];
+    if (e.key === 'Home' || e.key === 'End' || step) {
+      e.preventDefault();
+      const here = _timelineMonthOf(t.here || 0);
+      const i = e.key === 'Home' ? 0 : e.key === 'End' ? t.months.length - 1
+        : Math.min(t.months.length - 1, Math.max(0, here + step));
+      _jumpTo(t.starts[i]);
+    }
+  });
+  if ('ResizeObserver' in window) new ResizeObserver(() => { if (!rail.hidden) _drawTimeline(); }).observe(rail);
+}
+
+// Show the grid from this photo of the filtered list on.
+async function _jumpTo(offset) {
+  const grid = document.getElementById('gallery-grid');
+  if (!grid) return;
+  const index = offset - _baseOffset;
+  const cards = grid.querySelectorAll('.gallery-card[data-id]');
+  if (index >= 0 && index < cards.length) {   // already loaded: just scroll there
+    grid.scrollTop += cards[index].getBoundingClientRect().top - grid.getBoundingClientRect().top - 4;
+    _syncTimelineMarker();
+    return;
+  }
+  await _fetchLibrary(false, offset);
+  grid.scrollTop = 0;
+  _syncTimelineMarker();
+}
+
+// Scrolled back up after a jump: put the page before it above, keeping the view still.
+async function _loadNewer() {
+  if (_loadingNewer || _baseOffset <= 0) return;
+  _loadingNewer = true;
+  const seq = _fetchSeq;
+  const start = Math.max(0, _baseOffset - _computeFetchLimit());
+  const params = _libraryParams();
+  params.set('offset', String(start));
+  params.set('limit', String(_baseOffset - start));
+  try {
+    const data = await _jsonFetch(`/api/gallery/library?${params}`);
+    const grid = document.getElementById('gallery-grid');
+    if (seq !== _fetchSeq || !grid) return;   // the list was reloaded meanwhile
+    const before = grid.scrollHeight;
+    const top = grid.scrollTop;
+    _items = (data.items || []).concat(_items);
+    _baseOffset = start;
+    _renderGrid();
+    grid.scrollTop = top + (grid.scrollHeight - before);
+  } catch (err) {
+    console.error('Gallery: loading newer photos failed', err);
+  } finally {
+    _loadingNewer = false;
+  }
+}
+
+function _syncTimelineMarker() {
+  const rail = document.getElementById('gallery-timeline');
+  const grid = document.getElementById('gallery-grid');
+  const here = rail?.querySelector('.gallery-timeline-here');
+  if (!here || rail.hidden || !grid || !_timeline?.total) return;
+  const cards = grid.querySelectorAll('.gallery-card[data-id]');
+  if (!cards.length) return;
+  const top = grid.getBoundingClientRect().top;
+  let lo = 0, hi = cards.length - 1;   // first card not scrolled out above
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cards[mid].getBoundingClientRect().bottom <= top) lo = mid + 1; else hi = mid;
+  }
+  const offset = _baseOffset + lo;
+  _timeline.here = offset;
+  here.style.top = `${Math.min(100, (offset / _timeline.total) * 100)}%`;
+  rail.setAttribute('aria-valuenow', String(offset));
+  rail.setAttribute('aria-valuetext', _monthLabel(_timeline.months[_timelineMonthOf(offset)][0]));
+}
+
+function _onGridScroll() {
+  const grid = document.getElementById('gallery-grid');
+  if (!grid || !grid.offsetParent) return;
+  if (_baseOffset > 0 && grid.scrollTop < 400) _loadNewer();
+  _syncTimelineMarker();
+}
+
 function _renderAlbums() {
   const container = document.getElementById('gallery-album-chips');   // above search: active-filter indicators
   const filterC = document.getElementById('gallery-filter-chips');    // below search: All / Favorites
@@ -3069,7 +3276,15 @@ function _renderGrid() {
     return;
   }
 
-  let html = uploadTile;
+  // After a timeline jump the newer photos are above: a tile to bring them back.
+  let html = _baseOffset > 0
+    ? `<div class="gallery-card gallery-card-upload gallery-card-newer" id="gallery-newer-tile" role="button" tabindex="0" title="Show the newer photos above">
+         <div class="gallery-card-upload-inner">
+           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
+           <div class="gallery-card-upload-label">${_plural(_baseOffset, 'newer photo')}</div>
+         </div>
+       </div>`
+    : uploadTile;
   _items.forEach(img => {
     const date = img.taken_at
       ? new Date(img.taken_at).toLocaleDateString()
@@ -3122,6 +3337,11 @@ function _renderGrid() {
   });
   grid.innerHTML = html;
   _wireUploadTile();
+  const newerTile = document.getElementById('gallery-newer-tile');
+  newerTile?.addEventListener('click', () => _loadNewer());
+  newerTile?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); _loadNewer(); }
+  });
 
   // Domino-in cascade the first render after opening (not on filter/sort/
   // load-more re-renders) — mirrors the document library.
@@ -3132,7 +3352,7 @@ function _renderGrid() {
   }
 
   if (loadMore) {
-    loadMore.style.display = _items.length < _total ? 'block' : 'none';
+    loadMore.style.display = _baseOffset + _items.length < _total ? 'block' : 'none';
   }
 
   // Card click → detail (skip the upload tile, it has its own handler)
@@ -4059,7 +4279,10 @@ export function openGallery() {
         </div>
         <div class="gallery-tag-chips" id="gallery-tag-chips"></div>
         <div class="gallery-memories" id="gallery-memories" hidden></div>
-        <div class="gallery-grid" id="gallery-grid"></div>
+        <div class="gallery-grid-row">
+          <div class="gallery-grid" id="gallery-grid"></div>
+          <div class="gallery-timeline" id="gallery-timeline" role="slider" tabindex="0" aria-label="Timeline: jump to a month" aria-valuemin="0" hidden></div>
+        </div>
         <button class="gallery-load-more" id="gallery-load-more" style="display:none">Load more</button>
         <div class="gallery-detail" id="gallery-detail" style="display:none"></div>
         </div>
@@ -4338,7 +4561,7 @@ export function openGallery() {
   _wireLibrarySettings();
 
   document.getElementById('gallery-load-more').addEventListener('click', () => {
-    _offset = _items.length;
+    _offset = _baseOffset + _items.length;
     _fetchLibrary(true);
   });
 
@@ -4352,20 +4575,20 @@ export function openGallery() {
   let _scrollTick = false;
   const _maybeAutoLoad = () => {
     _scrollTick = false;
-    if (!_open || _loadingMore || _items.length >= _total) return;
+    if (!_open || _loadingMore || _baseOffset + _items.length >= _total) return;
     const btn = document.getElementById('gallery-load-more');
     if (!btn || btn.style.display === 'none' || !btn.offsetParent) return;  // hidden / nothing more
     const r = btn.getBoundingClientRect();
     if (r.top <= window.innerHeight + 600) {   // within 600px of the viewport bottom
       _loadingMore = true;
-      _offset = _items.length;
+      _offset = _baseOffset + _items.length;
       Promise.resolve(_fetchLibrary(true)).finally(() => { _loadingMore = false; });
     }
   };
   document.addEventListener('scroll', () => {
     if (_scrollTick) return;
     _scrollTick = true;
-    requestAnimationFrame(_maybeAutoLoad);
+    requestAnimationFrame(() => { _maybeAutoLoad(); _onGridScroll(); });
   }, true);
 
   // When the window grows (e.g. entering fullscreen), the visible grid
@@ -4377,9 +4600,9 @@ export function openGallery() {
     clearTimeout(_resizeTopUpTimer);
     _resizeTopUpTimer = setTimeout(() => {
       if (!_open) return;
-      if (_items.length >= _total) return;        // already have everything
+      if (_baseOffset + _items.length >= _total) return;   // already have everything
       if (_computeFetchLimit() <= _items.length) return; // viewport not bigger than current load
-      _offset = _items.length;
+      _offset = _baseOffset + _items.length;
       _fetchLibrary(true);
     }, 300);
   };
