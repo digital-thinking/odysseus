@@ -2277,15 +2277,8 @@ function _syncTimelineMarker() {
   const grid = document.getElementById('gallery-grid');
   const here = rail?.querySelector('.gallery-timeline-here');
   if (!here || rail.hidden || !grid || !_timeline?.total) return;
-  const cards = grid.querySelectorAll('.gallery-card[data-id]');
-  if (!cards.length) return;
-  const top = grid.getBoundingClientRect().top;
-  let lo = 0, hi = cards.length - 1;   // first card not scrolled out above
-  while (lo < hi) {
-    const mid = (lo + hi) >> 1;
-    if (cards[mid].getBoundingClientRect().bottom <= top) lo = mid + 1; else hi = mid;
-  }
-  const offset = _baseOffset + lo;
+  if (!grid.querySelector('.gallery-card[data-id]')) return;
+  const offset = _baseOffset + _firstVisibleIndex();
   _timeline.here = offset;
   here.style.top = `${Math.min(100, (offset / _timeline.total) * 100)}%`;
   rail.setAttribute('aria-valuenow', String(offset));
@@ -2297,6 +2290,231 @@ function _onGridScroll() {
   if (!grid || !grid.offsetParent) return;
   if (_baseOffset > 0 && grid.scrollTop < 400) _loadNewer();
   _syncTimelineMarker();
+}
+
+// ---- Slideshow ----
+// Full screen, plays the current Photos list (its filters and order) from one
+// photo on, fetching further pages as it goes and looping at the end. Videos
+// are skipped. Keys: Space pause, ←/→ previous/next, F full screen, Esc close.
+
+const _SLIDE_SECONDS = [3, 5, 8, 12, 20];
+const _SLIDE_PAGE = 30;
+let _show = null;
+
+const _SLIDE_ICONS = {
+  prev: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 5h2v14H6zM20 5v14L9 12z"/></svg>',
+  next: '<svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M16 5h2v14h-2zM4 5v14l11-7z"/></svg>',
+  play: '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l13-8z"/></svg>',
+  pause: '<svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M6 4h4v16H6zM14 4h4v16h-4z"/></svg>',
+  full: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5"/></svg>',
+  close: '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+};
+
+// Index in _items of the first card not scrolled out above the grid.
+function _firstVisibleIndex() {
+  const grid = document.getElementById('gallery-grid');
+  const cards = grid ? grid.querySelectorAll('.gallery-card[data-id]') : [];
+  if (!cards.length) return 0;
+  const top = grid.getBoundingClientRect().top;
+  let lo = 0, hi = cards.length - 1;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (cards[mid].getBoundingClientRect().bottom <= top) lo = mid + 1; else hi = mid;
+  }
+  return lo;
+}
+
+function _slidePage(page) {
+  const s = _show;
+  if (!s.pages.has(page)) {
+    const params = new URLSearchParams(s.params);
+    params.set('offset', String(page * _SLIDE_PAGE));
+    params.set('limit', String(_SLIDE_PAGE));
+    s.pages.set(page, _jsonFetch(`/api/gallery/library?${params}`).then(d => d.items || []).catch((err) => {
+      s.pages.delete(page);   // try again next time round
+      throw err;
+    }));
+  }
+  return s.pages.get(page);
+}
+
+async function _slideItem(index) {
+  const items = await _slidePage(Math.floor(index / _SLIDE_PAGE));
+  return items[index % _SLIDE_PAGE] || null;
+}
+
+function _slideWrap(s, index) { return ((index % s.total) + s.total) % s.total; }
+
+async function _slideTo(index, step = 1) {
+  const s = _show;
+  if (!s) return;
+  const seq = ++s.seq;
+  clearTimeout(s.timer);
+  s.target = _slideWrap(s, index);   // quick presses count on from here, not from the photo still shown
+  let item = null;
+  try {
+    for (let tries = 0; tries < _SLIDE_PAGE && !item; tries++, index += step) {
+      const candidate = await _slideItem(_slideWrap(s, index));
+      if (candidate && !_isVideoUrl(candidate.url)) item = candidate;
+    }
+  } catch (err) {
+    if (_show === s) uiModule.showError(`Slideshow: ${err.message}`);
+  }
+  if (seq !== s.seq || _show !== s) return;
+  if (!item) { _stopSlideshow(); return; }
+  index = _slideWrap(s, index - step);
+  const layers = s.el.querySelectorAll('.gallery-slide');
+  const next = layers[1 - s.front];
+  next.classList.remove('gallery-slide-in', 'gallery-slide-zoom');
+  next.src = item.url;
+  try { await next.decode(); } catch (_) { /* shown as it loads */ }
+  if (seq !== s.seq || _show !== s) return;
+  layers[s.front].classList.remove('gallery-slide-in');
+  next.style.animationDuration = `${s.seconds + 1.5}s`;
+  next.classList.add('gallery-slide-in', 'gallery-slide-zoom');
+  s.front = 1 - s.front;
+  s.index = s.target = index;
+  const when = item.taken_at || item.created_at;
+  s.el.querySelector('.gallery-slideshow-title').textContent = (item.caption || '').trim() || item.prompt || '';
+  s.el.querySelector('.gallery-slideshow-when').textContent = when
+    ? new Date(String(when).slice(0, 19)).toLocaleDateString(undefined, { day: 'numeric', month: 'long', year: 'numeric' })
+    : '';
+  s.el.querySelector('.gallery-slideshow-pos').textContent = `${(index + 1).toLocaleString()} / ${s.total.toLocaleString()}`;
+  _slideItem(_slideWrap(s, index + step)).then(n => { if (n && !_isVideoUrl(n.url)) new Image().src = n.url; }).catch(() => {});
+  _slideSchedule();
+}
+
+function _slideSchedule() {
+  const s = _show;
+  if (!s) return;
+  clearTimeout(s.timer);
+  if (s.playing) s.timer = setTimeout(() => _slideTo(s.index + 1), s.seconds * 1000);
+}
+
+function _slidePlay(playing) {
+  const s = _show;
+  s.playing = playing;
+  const btn = s.el.querySelector('[data-act="play"]');
+  btn.innerHTML = playing ? _SLIDE_ICONS.pause : _SLIDE_ICONS.play;
+  btn.title = playing ? 'Pause (Space)' : 'Play (Space)';
+  btn.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+  s.el.classList.toggle('gallery-slideshow-paused', !playing);
+  _slideSchedule();
+}
+
+function _slideFullscreen() {
+  const s = _show;
+  if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
+  else s.el.requestFullscreen?.().catch(() => {});
+}
+
+function _slideStep(step) { _slideTo(_show.target + step, step); }
+
+// Controls and pointer fade out while a show plays undisturbed.
+function _slideWake() {
+  const s = _show;
+  if (!s) return;
+  s.el.classList.remove('gallery-slideshow-idle');
+  clearTimeout(s.idle);
+  s.idle = setTimeout(() => { if (_show === s && s.playing) s.el.classList.add('gallery-slideshow-idle'); }, 2500);
+}
+
+function _startSlideshow(startAt = 0) {
+  if (_show || !_total) return;
+  let seconds = 5;
+  try { seconds = Number(localStorage.getItem('gallery-slideshow-seconds')) || 5; } catch (_) {}
+  if (!_SLIDE_SECONDS.includes(seconds)) seconds = 5;
+  const el = document.createElement('div');
+  el.className = 'gallery-slideshow';
+  el.tabIndex = -1;
+  el.setAttribute('role', 'dialog');
+  el.setAttribute('aria-modal', 'true');
+  el.setAttribute('aria-label', 'Slideshow');
+  el.innerHTML = `
+    <img class="gallery-slide" alt="">
+    <img class="gallery-slide" alt="">
+    <div class="gallery-slideshow-caption">
+      <span class="gallery-slideshow-when"></span>
+      <span class="gallery-slideshow-title"></span>
+    </div>
+    <div class="gallery-slideshow-bar">
+      <button type="button" data-act="prev" title="Previous (←)" aria-label="Previous">${_SLIDE_ICONS.prev}</button>
+      <button type="button" data-act="play">${_SLIDE_ICONS.pause}</button>
+      <button type="button" data-act="next" title="Next (→)" aria-label="Next">${_SLIDE_ICONS.next}</button>
+      <span class="gallery-slideshow-pos" aria-live="polite"></span>
+      <select class="gallery-slideshow-seconds" title="Seconds per photo" aria-label="Seconds per photo">
+        ${_SLIDE_SECONDS.map(n => `<option value="${n}"${n === seconds ? ' selected' : ''}>${n} s</option>`).join('')}
+      </select>
+      <button type="button" data-act="full" title="Full screen (F)" aria-label="Full screen">${_SLIDE_ICONS.full}</button>
+      <button type="button" data-act="close" title="Close (Esc)" aria-label="Close slideshow">${_SLIDE_ICONS.close}</button>
+    </div>`;
+  document.body.appendChild(el);
+  const params = _libraryParams();   // a snapshot: changing filters later does not change a running show
+  params.delete('offset');
+  params.delete('limit');
+  _show = {
+    el, params: params.toString(), total: _total, pages: new Map(), index: startAt, target: startAt, front: 0,
+    playing: true, seconds, timer: null, idle: null, seq: 0, keys: null, opener: document.activeElement,
+  };
+  const s = _show;
+  _slidePlay(true);
+
+  let downX = null;
+  el.addEventListener('pointerdown', (e) => { downX = e.clientX; });
+  el.addEventListener('click', (e) => {
+    const act = e.target.closest('[data-act]')?.dataset.act;
+    if (act === 'prev') _slideStep(-1);
+    else if (act === 'next') _slideStep(1);
+    else if (act === 'play') _slidePlay(!s.playing);
+    else if (act === 'full') _slideFullscreen();
+    else if (act === 'close') _stopSlideshow();
+    else if (!e.target.closest('.gallery-slideshow-bar')) {
+      // A swipe goes back or forward; a tap pauses or plays.
+      const dx = downX === null ? 0 : e.clientX - downX;
+      if (Math.abs(dx) > 50) _slideStep(dx < 0 ? 1 : -1);
+      else _slidePlay(!s.playing);
+    }
+    _slideWake();
+  });
+  el.querySelector('.gallery-slideshow-seconds').addEventListener('change', (e) => {
+    s.seconds = Number(e.target.value) || 5;
+    try { localStorage.setItem('gallery-slideshow-seconds', String(s.seconds)); } catch (_) {}
+    _slideSchedule();
+  });
+  el.addEventListener('pointermove', _slideWake);
+  s.keys = (e) => {
+    if (_show !== s || e.target.closest?.('select')) return;
+    const key = e.key;
+    let handled = true;
+    if (key === ' ' || key === 'k') _slidePlay(!s.playing);
+    else if (key === 'ArrowRight' || key === 'l') _slideStep(1);
+    else if (key === 'ArrowLeft' || key === 'j') _slideStep(-1);
+    else if (key === 'f' || key === 'F') _slideFullscreen();
+    else if (key === 'Escape') _stopSlideshow();
+    else handled = false;
+    if (handled) {
+      e.preventDefault();
+      e.stopImmediatePropagation();   // the gallery's own keys (Esc closes it) stay out of it
+      _slideWake();
+    }
+  };
+  window.addEventListener('keydown', s.keys, true);
+  el.requestFullscreen?.().catch(() => {});   // started by a click, so the browser allows it
+  el.focus();
+  _slideWake();
+  _slideTo(startAt);
+}
+
+function _stopSlideshow() {
+  const s = _show;
+  if (!s) return;
+  _show = null;
+  clearTimeout(s.timer);
+  clearTimeout(s.idle);
+  window.removeEventListener('keydown', s.keys, true);
+  if (document.fullscreenElement === s.el) document.exitFullscreen?.().catch(() => {});
+  s.el.remove();
+  s.opener?.focus?.();
 }
 
 function _renderAlbums() {
@@ -3484,6 +3702,10 @@ function _openDetail(img) {
         <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         Download
       </button>
+      <button class="gallery-detail-back" id="gallery-slideshow-btn" title="Slideshow from this photo" aria-label="Slideshow from this photo" style="display:inline-flex;align-items:center;gap:4px;">
+        <svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l13-8z"/></svg>
+        Slideshow
+      </button>
       <button class="gallery-detail-back gallery-detail-fav-header${img.favorite ? ' active' : ''}" id="gallery-detail-fav-header" title="${img.favorite ? 'Unfavorite' : 'Favorite'}" aria-label="Favorite" aria-pressed="${img.favorite ? 'true' : 'false'}" style="display:inline-flex;align-items:center;justify-content:center;padding:4px 8px;">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="${img.favorite ? 'currentColor' : 'none'}" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/></svg>
       </button>
@@ -3588,6 +3810,10 @@ function _openDetail(img) {
   `;
   detail.style.display = 'flex';
 
+  document.getElementById('gallery-slideshow-btn')?.addEventListener('click', () => {
+    const at = _items.findIndex(i => i.id === img.id);
+    _startSlideshow(at >= 0 ? _baseOffset + at : 0);
+  });
   document.getElementById('gallery-detail-back').addEventListener('click', () => {
     detail.style.display = 'none';
   });
@@ -4267,6 +4493,7 @@ export function openGallery() {
             <option value="taken_asc"${_sort === 'taken_asc' ? ' selected' : ''}>↑ Date taken</option>
             <option value="nearest" hidden>📍 Nearest first</option>
           </select>
+          <button class="gallery-select-btn gallery-toolbar-action gallery-slideshow-start" id="gallery-slideshow-start" title="Slideshow of these photos" aria-label="Slideshow of these photos"><svg width="11" height="11" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M7 4v16l13-8z"/></svg></button>
           <button class="gallery-select-btn gallery-toolbar-action" id="gallery-select-btn" title="Select for bulk actions" style="position:relative;top:0;"><span>Select</span></button>
         </div>
         <div class="gallery-album-chips" id="gallery-filter-chips" style="margin-top:0;"></div>
@@ -4538,6 +4765,10 @@ export function openGallery() {
     // re-shuffles, not just re-renders the same seeded order.
     if (_sort === 'shuffle') _shuffleSeed = Math.floor(Math.random() * 2 ** 31);
     _fetchLibrary(false);
+  });
+
+  document.getElementById('gallery-slideshow-start').addEventListener('click', () => {
+    _startSlideshow(_baseOffset + _firstVisibleIndex());   // from the first photo on screen
   });
 
   document.getElementById('gallery-model-filter').addEventListener('change', (e) => {
@@ -5340,6 +5571,7 @@ function _doCloseGallery() {
     return;
   }
   _open = false;
+  _stopSlideshow();
   clearTimeout(_searchDebounce);
   if (_galleryResizeHandler) {
     window.removeEventListener('resize', _galleryResizeHandler);
