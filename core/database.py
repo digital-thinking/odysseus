@@ -524,14 +524,22 @@ def _gallery_tags_of(row: str) -> str:
 # 2 KB embedding. These indexes hold what filters, counts and sorting need, so
 # those queries never touch the wide rows. Partial indexes only apply to queries
 # that spell out the same condition with literals (see _HAS_AI_TAGS in the routes).
+# Newest and oldest first. Must stay the same expression as _NEWEST_KEY in the gallery routes.
+_GALLERY_NEWEST = "(CASE WHEN source_id IS NOT NULL THEN coalesce(taken_at, created_at) ELSE created_at END)"
 _GALLERY_IMAGE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_browse ON gallery_images "
     "(owner, is_active, coalesce(taken_at, created_at) DESC, source_relpath DESC, id, source_id)",
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_newest ON gallery_images "
+    f"(owner, is_active, {_GALLERY_NEWEST} DESC, source_relpath DESC, id, source_id)",
+    # Narrow on purpose: this is the one the photo count of every page reads.
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_recent ON gallery_images (owner, is_active, created_at DESC, id)",
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_models ON gallery_images (owner, is_active, model)",
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_lookup ON gallery_images (id, is_active, taken_at)",
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_album ON gallery_images "
     "(album_id, is_active, owner, created_at DESC)",
+    # Without this, an album sorted by date walks the whole library to find its photos.
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_album_newest ON gallery_images "
+    f"(album_id, is_active, owner, {_GALLERY_NEWEST} DESC, source_relpath DESC)",
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_changed ON gallery_images (owner, updated_at)",
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_prompt ON gallery_images (prompt, id)",
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_user_tags ON gallery_images (owner, is_active, tags) "

@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query, Request
-from sqlalchemy import func, or_, select, text
+from sqlalchemy import case, func, or_, select, text
 from sqlalchemy.orm import aliased
 
 from core.database import (
@@ -56,6 +56,14 @@ _SIMILAR_RESULTS = 200   # "Similar photos": how many nearest neighbours to list
 _HAS_USER_TAGS = text("gallery_images.tags IS NOT NULL AND gallery_images.tags != ''")
 _HAS_AI_TAGS = text("gallery_images.ai_tags IS NOT NULL AND gallery_images.ai_tags != ''")
 _MAX_TAGS_PER_FILTER = 2000   # a broader match ("a") is cheaper as a plain text scan
+
+# Newest and oldest first. created_at of a library photo is only when it was indexed, so those
+# go by the date taken. Uploads and generated images go by when they arrived, which keeps a
+# fresh upload on top even if the photo is old. ix_gallery_images_newest indexes this expression.
+_NEWEST_KEY = case(
+    (GalleryImage.source_id.isnot(None), func.coalesce(GalleryImage.taken_at, GalleryImage.created_at)),
+    else_=GalleryImage.created_at,
+)
 
 
 def _uses_tag_table(db) -> bool:
@@ -1454,13 +1462,13 @@ def setup_gallery_routes() -> APIRouter:
                 taken = func.coalesce(GalleryImage.taken_at, GalleryImage.created_at)
                 q = q.add_columns(DbSession.name).outerjoin(DbSession, GalleryImage.session_id == DbSession.id)
                 if sort == "oldest":
-                    q = q.order_by(GalleryImage.created_at.asc())
+                    q = q.order_by(_NEWEST_KEY.asc(), GalleryImage.source_relpath.asc())
                 elif sort == "taken_desc":
                     q = q.order_by(taken.desc(), GalleryImage.source_relpath.desc())
                 elif sort == "taken_asc":
                     q = q.order_by(taken.asc(), GalleryImage.source_relpath.asc())
                 else:  # recent
-                    q = q.order_by(GalleryImage.created_at.desc())
+                    q = q.order_by(_NEWEST_KEY.desc(), GalleryImage.source_relpath.desc())
                 rows = q.offset(offset).limit(limit).all()
 
             items = []

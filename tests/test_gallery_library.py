@@ -425,6 +425,27 @@ def test_tags_with_quotes_and_backslashes_cannot_break_the_tag_index(lib):
     assert _tag_rows(lib) == []
 
 
+def test_newest_first_goes_by_date_taken_and_a_fresh_upload_stays_on_top(lib):
+    source_id = _add_source(lib, path=HOST_ROOT).json()["source"]["id"]
+    _scan(lib, source_id)
+    # Indexed last but taken first, like a photo restored from a backup.
+    _jpeg(lib["root"] / "2004" / "restored.jpg", exif_date="2004:01:02 10:00:00")
+    _scan(lib, source_id)
+    db = lib["db"]()
+    # An old photo, uploaded just now. Its date taken must not bury it.
+    _photo(db, "upload", taken_at=datetime(2001, 1, 1), created_at=datetime(2099, 1, 1))
+    db.close()
+
+    def order(sort):
+        items = lib["client"].get("/api/gallery/library", params={"sort": sort}).json()["items"]
+        return [i.get("source_path") or i["id"] for i in items]
+
+    newest = ["upload", "2006/later.jpg", "2005/04 sep/Foto(01).jpg", "2005/2 Juni/Foto(01).jpg",
+              "2004/restored.jpg"]
+    assert order("recent") == newest
+    assert order("oldest") == newest[::-1]
+
+
 def test_tag_filters_and_search_keep_their_meaning(lib):
     db = lib["db"]()
     _photo(db, "a", ai_tags="young man, sandy beach", prompt="IMG_1.jpg")
@@ -537,6 +558,7 @@ def test_the_migration_fills_the_tag_index_of_an_existing_database(lib, monkeypa
     conn = sqlite3.connect(path)
     conn.execute("DROP TRIGGER gallery_images_tags_ai")
     conn.execute("DROP INDEX ix_gallery_images_browse")
+    conn.execute("DROP INDEX ix_gallery_images_newest")
     conn.execute("DELETE FROM gallery_image_tags")
     conn.commit()
     conn.close()
@@ -551,11 +573,15 @@ def test_the_migration_fills_the_tag_index_of_an_existing_database(lib, monkeypa
     assert ("new", "p3") in _tag_rows(lib)
     conn = sqlite3.connect(path)
     assert conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'ix_gallery_images_browse'").fetchone()
+    assert conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'ix_gallery_images_newest'").fetchone()
     conn.close()
 
 
 def test_searches_use_the_indexes_instead_of_reading_every_photo(lib):
     from sqlalchemy import text as sql
+    from sqlalchemy.dialects import sqlite
+
+    from routes.gallery.gallery_routes import _NEWEST_KEY
 
     db = lib["db"]()
 
@@ -567,6 +593,15 @@ def test_searches_use_the_indexes_instead_of_reading_every_photo(lib):
             " ORDER BY coalesce(gallery_images.taken_at, gallery_images.created_at) DESC,"
             " gallery_images.source_relpath DESC LIMIT 60")
     assert "ix_gallery_images_browse" in plan(page) and "TEMP B-TREE" not in plan(page)
+    # the real sort key, so the route and the index cannot drift apart
+    key = _NEWEST_KEY.compile(dialect=sqlite.dialect(), compile_kwargs={"literal_binds": True})
+    for direction in ("DESC", "ASC"):
+        newest = ("SELECT * FROM gallery_images WHERE " + active +
+                  f" ORDER BY {key} {direction}, gallery_images.source_relpath {direction} LIMIT 60")
+        assert "ix_gallery_images_newest" in plan(newest) and "TEMP B-TREE" not in plan(newest)
+        in_album = newest.replace(" ORDER BY", " AND gallery_images.album_id = 'a' ORDER BY")
+        assert "ix_gallery_images_album_newest" in plan(in_album) and "TEMP B-TREE" not in plan(in_album)
+    assert "COVERING INDEX ix_gallery_images_recent" in plan("SELECT count(id) FROM gallery_images WHERE " + active)
     assert "ix_gallery_images_ai_tagged" in plan(
         "SELECT count(*) FROM gallery_images WHERE " + active +
         " AND gallery_images.ai_tags IS NOT NULL AND gallery_images.ai_tags != ''")
