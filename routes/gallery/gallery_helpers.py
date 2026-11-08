@@ -11,7 +11,7 @@ from typing import Dict, Any, Optional
 from pydantic import BaseModel
 from sqlalchemy import case, func
 
-from core.database import GalleryImage
+from core.database import GalleryAlbum, GalleryImage
 from src.auth_helpers import _auth_disabled
 
 logger = logging.getLogger(__name__)
@@ -145,6 +145,7 @@ def _image_to_dict(img: GalleryImage, session_name: str = None) -> Dict[str, Any
         "taken_at": img.taken_at.isoformat() if img.taken_at else None,
         "camera": f"{img.camera_make or ''} {img.camera_model or ''}".strip() or None,
         "gps": {"lat": img.gps_lat, "lng": img.gps_lng} if img.gps_lat else None,
+        "location_estimated": bool(img.gps_lat) and getattr(img, "location_source", None) == "time",
         "width": img.width,
         "height": img.height,
         "file_size": img.file_size,
@@ -174,3 +175,10 @@ def _human_size(nbytes):
             return f"{nbytes:.1f} {unit}"
         nbytes /= 1024
     return f"{nbytes:.1f} PB"
+
+
+def library_signature(db, user) -> tuple:
+    """Changes whenever photos or albums are added, removed or edited (two index-only reads)."""
+    photos = _owner_filter(db.query(func.count(), func.max(GalleryImage.updated_at)), user).one()
+    albums = _owner_filter(db.query(func.count(), func.max(GalleryAlbum.updated_at)), user, GalleryAlbum).one()
+    return tuple(photos) + tuple(albums)

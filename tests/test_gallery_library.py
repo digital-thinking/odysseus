@@ -425,6 +425,23 @@ def test_tags_with_quotes_and_backslashes_cannot_break_the_tag_index(lib):
     assert _tag_rows(lib) == []
 
 
+def test_a_rescan_keeps_an_estimated_location(lib):
+    source_id = _add_source(lib, path=HOST_ROOT).json()["source"]["id"]
+    _scan(lib, source_id)
+    db = lib["db"]()
+    photo = db.query(GalleryImage).filter(GalleryImage.source_relpath == "2006/later.jpg").one()
+    photo.gps_lat, photo.gps_lng, photo.location_source = "41.902800", "12.496400", "time"
+    db.commit()
+    db.close()
+    # The photo is edited (new content, still no GPS of its own): the estimate stays.
+    _jpeg(lib["root"] / "2006" / "later.jpg", color=(1, 2, 3), mtime=datetime(2007, 1, 1).timestamp())
+    assert _scan(lib, source_id)["updated"] == 1
+    db = lib["db"]()
+    photo = db.query(GalleryImage).filter(GalleryImage.source_relpath == "2006/later.jpg").one()
+    assert (photo.gps_lat, photo.gps_lng, photo.location_source) == ("41.902800", "12.496400", "time")
+    db.close()
+
+
 def test_newest_first_goes_by_date_taken_and_a_fresh_upload_stays_on_top(lib):
     source_id = _add_source(lib, path=HOST_ROOT).json()["source"]["id"]
     _scan(lib, source_id)

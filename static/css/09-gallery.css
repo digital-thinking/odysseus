@@ -1775,3 +1775,19 @@ path.gallery-map-hover { stroke: #fff; fill: var(--hl-function); fill-opacity: 0
   .gallery-slideshow-bar { bottom: 12px; gap: 0; padding: 4px 6px; }
   .gallery-slideshow-pos { min-width: 0; }
 }
+
+/* ---- Estimated locations ---- */
+.gallery-map-estimate:empty { display: none; }
+.gallery-map-estimate { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+.gallery-map-estimate p { margin: 0 0 8px; }
+.gallery-map-estimate .memory-toolbar-btn { height: auto; padding: 5px 10px; }
+.gallery-map-estimate-done { font-size: 11px; opacity: 0.8; }
+.gallery-map-estimate-undo {
+  height: auto; padding: 0; border: none; background: none; color: var(--red);
+  font: inherit; text-decoration: underline; cursor: pointer;
+}
+.gallery-detail-estimated {
+  display: inline-block; margin-left: 4px; padding: 0 5px; border-radius: 4px; vertical-align: 1px;
+  font-size: 9px; font-weight: 500; text-transform: none; letter-spacing: 0;
+  border: 1px solid var(--border); opacity: 0.8;
+}

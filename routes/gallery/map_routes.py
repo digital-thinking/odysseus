@@ -10,6 +10,10 @@ Place names are looked up with OpenStreetMap's Nominatim, through the server
 so the browser only talks to Odysseus. Its usage policy allows one request a
 second from an application that names itself, so lookups are spaced out and
 remembered. Typed coordinates ("49.02, 8.35") need no lookup at all.
+
+A photo without GPS can take the spot of a photo taken at the same time
+(src/gallery_library/locations.py, /api/gallery/locations/estimate);
+``location_source = "time"`` marks those, so they can be told apart and undone.
 """
 
 import asyncio
@@ -23,11 +27,12 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query, Request
-from sqlalchemy import func
+from sqlalchemy import bindparam, func, or_, update
 
 from core.database import GalleryImage, SessionLocal
-from routes.gallery.gallery_helpers import _owner_filter
+from routes.gallery.gallery_helpers import _owner_filter, library_signature
 from src.auth_helpers import get_current_user
+from src.gallery_library import locations as _locations
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +46,9 @@ _NOMINATIM_INTERVAL = 1.0      # seconds between two lookups (usage policy)
 _PLACE_RESULTS = 6
 _PLACE_QUERY_MAX = 160
 _PLACE_CACHE_SIZE = 256
+
+_estimate_cache: Dict[Any, tuple] = {}   # owner -> (library signature, counts)
+_estimate_lock = asyncio.Lock()
 
 _COORDINATES = re.compile(r"^\s*(-?\d{1,3}(?:\.\d+)?)\s*[,;\s]\s*(-?\d{1,3}(?:\.\d+)?)\s*$")
 _LANGUAGE = re.compile(r"[^A-Za-z0-9,;=.\- *]")
@@ -217,3 +225,94 @@ def register_map_routes(router: APIRouter) -> None:
             raise HTTPException(502, "Place search is not reachable right now. "
                                      "You can still click the map to pick a spot.")
         return {"places": places, "source": "OpenStreetMap Nominatim"}
+
+    # ---- estimated locations (src/gallery_library/locations.py) ----
+
+    def plan(db, user) -> Dict[str, Any]:
+        rows = _owner_filter(db.query(GalleryImage.id, GalleryImage.taken_at, GalleryImage.gps_lat,
+                                      GalleryImage.gps_lng)
+                             .filter(GalleryImage.is_active == True, GalleryImage.gps_lat.isnot(None)),  # noqa: E712
+                             user).all()
+        estimated = {i for (i,) in _owner_filter(  # ix_gallery_images_estimated
+            db.query(GalleryImage.id).filter(GalleryImage.location_source.isnot(None)), user)}
+        donors = [(when, lat, lng) for image_id, when, lat, lng in rows if image_id not in estimated]
+        # Photos from a camera (EXIF make or model), so their time is when they were taken,
+        # not a file date. Screenshots and saved images stay where they are.
+        missing = _owner_filter(db.query(GalleryImage.id, GalleryImage.taken_at).filter(
+            GalleryImage.is_active == True, GalleryImage.gps_lat.is_(None),  # noqa: E712
+            GalleryImage.taken_at.isnot(None),
+            or_(GalleryImage.camera_make.isnot(None), GalleryImage.camera_model.isnot(None))), user).all()
+        return {
+            "missing": len(missing),
+            "placed": _locations.estimate(donors, missing),
+            "estimated": sum(1 for image_id, *_ in rows if image_id in estimated),
+        }
+
+    def preview(user) -> Dict[str, Any]:
+        db = SessionLocal()
+        try:
+            signature = library_signature(db, user)
+            cached = _estimate_cache.get(user)
+            if cached and cached[0] == signature:
+                return cached[1]
+            found = plan(db, user)
+            counts = {"missing": found["missing"], "possible": len(found["placed"]),
+                      "estimated": found["estimated"]}
+            _estimate_cache[user] = (signature, counts)
+            return counts
+        finally:
+            db.close()
+
+    def apply(user) -> int:
+        db = SessionLocal()
+        try:
+            placed = plan(db, user)["placed"]   # ids of this user's photos only
+            if not placed:
+                return 0
+            # One statement, each row found by its primary key: with the owner in the
+            # WHERE clause SQLite walked the owner's photos once per row (50 s for 967).
+            table = GalleryImage.__table__
+            stmt = (update(table)
+                    .where(table.c.id == bindparam("b_id"), table.c.gps_lat.is_(None))  # a scan may have found one
+                    .values(gps_lat=bindparam("b_lat"), gps_lng=bindparam("b_lng"),
+                            location_source=_locations.SOURCE))
+            result = db.execute(stmt, [{"b_id": image_id, "b_lat": lat, "b_lng": lng}
+                                       for image_id, (lat, lng) in placed.items()])
+            db.commit()
+            return result.rowcount
+        finally:
+            db.close()
+
+    def clear(user) -> int:
+        db = SessionLocal()
+        try:
+            cleared = _owner_filter(db.query(GalleryImage).filter(
+                GalleryImage.location_source == _locations.SOURCE), user).update(
+                {GalleryImage.gps_lat: None, GalleryImage.gps_lng: None, GalleryImage.location_source: None},
+                synchronize_session=False)
+            db.commit()
+            return cleared
+        finally:
+            db.close()
+
+    @router.get("/api/gallery/locations/estimate")
+    async def estimate_preview(request: Request) -> Dict[str, Any]:
+        """How many photos without a location could be placed by the time they were taken."""
+        return await asyncio.to_thread(preview, get_current_user(request))
+
+    @router.post("/api/gallery/locations/estimate")
+    async def estimate_apply(request: Request) -> Dict[str, Any]:
+        """Place them: each takes the spot of a photo with a location taken at the same time."""
+        user = get_current_user(request)
+        async with _estimate_lock:
+            placed = await asyncio.to_thread(apply, user)
+        logger.info("Estimated locations: placed %d photos", placed)
+        return {"placed": placed, **await asyncio.to_thread(preview, user)}
+
+    @router.delete("/api/gallery/locations/estimate")
+    async def estimate_clear(request: Request) -> Dict[str, Any]:
+        """Take every estimated location away again (locations from the files stay)."""
+        user = get_current_user(request)
+        async with _estimate_lock:
+            cleared = await asyncio.to_thread(clear, user)
+        return {"cleared": cleared, **await asyncio.to_thread(preview, user)}

@@ -480,6 +480,9 @@ class GalleryImage(TimestampMixin, Base):
     source_mtime   = Column(Float, nullable=True)    # change detection on rescan
     source_state   = Column(String, nullable=True)   # ok | missing | hidden
     faces_scanned  = Column(String, nullable=True)   # face model pack the photo was scanned with
+    # Where gps_lat/gps_lng came from: NULL = the file itself, "time" = estimated from a photo
+    # taken at the same time (src/gallery_library/locations.py).
+    location_source = Column(String, nullable=True)
 
     session = relationship("Session", backref=backref("gallery_images"))
     album   = relationship("GalleryAlbum", back_populates="images")
@@ -550,6 +553,9 @@ _GALLERY_IMAGE_INDEXES = (
     # Partial, so no query that does not ask for gps_lat IS NOT NULL can pick it.
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_located ON gallery_images "
     "(owner, is_active, gps_lat, gps_lng, taken_at, id) WHERE gps_lat IS NOT NULL",
+    # The few estimated locations, so telling them apart does not read every located photo.
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_estimated ON gallery_images (owner, location_source, id) "
+    "WHERE location_source IS NOT NULL",
 )
 _GALLERY_FACE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_gallery_faces_owner_person ON gallery_faces "
@@ -1772,6 +1778,7 @@ def _migrate_add_gallery_library_columns():
             ("source_mtime", "REAL"),
             ("source_state", "TEXT"),
             ("faces_scanned", "TEXT"),
+            ("location_source", "TEXT"),
         ):
             if name not in columns:
                 conn.execute(f"ALTER TABLE gallery_images ADD COLUMN {name} {ddl}")

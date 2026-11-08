@@ -24,7 +24,9 @@ from fastapi import APIRouter, HTTPException, Query, Request
 from sqlalchemy import func
 
 from core.database import GalleryAlbum, GalleryImage, SessionLocal
-from routes.gallery.gallery_helpers import NEWEST_KEY, TAKEN_KEY, _image_to_dict, _image_urls, _owner_filter
+from routes.gallery.gallery_helpers import (
+    NEWEST_KEY, TAKEN_KEY, _image_to_dict, _image_urls, _owner_filter, library_signature,
+)
 from routes.gallery.map_routes import to_point
 from src.auth_helpers import get_current_user
 from src.gallery_library import places
@@ -43,13 +45,6 @@ _YEAR_ONLY = re.compile(r"^\s*\d{4}\s*$")
 _lock = threading.Lock()
 _trip_cache: Dict[Any, tuple] = {}      # owner -> (library signature, trips)
 _day_cache: Dict[Any, tuple] = {}       # owner -> (signature, date, result)
-
-
-def library_signature(db, user) -> tuple:
-    """Changes whenever photos or albums are added, removed or edited (two index-only reads)."""
-    photos = _owner_filter(db.query(func.count(), func.max(GalleryImage.updated_at)), user).one()
-    albums = _owner_filter(db.query(func.count(), func.max(GalleryAlbum.updated_at)), user, GalleryAlbum).one()
-    return tuple(photos) + tuple(albums)
 
 
 @lru_cache(maxsize=20000)

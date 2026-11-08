@@ -181,6 +181,10 @@ def scan_source(
                     "source_state": "ok",
                     "is_active": True,
                 }
+                if exif.get("gps_lat"):
+                    fields["location_source"] = None     # the file's own location replaces an estimate
+                elif row is not None and row.location_source:
+                    del fields["gps_lat"], fields["gps_lng"]   # keep the estimated location
                 if row is not None:
                     content_changed = row.file_hash != file_hash
                     for key, value in fields.items():

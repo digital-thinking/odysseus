@@ -1757,7 +1757,9 @@ async function _renderNearest() {
         <strong>Find photos by place</strong>
         <p>Search for a place, or click a bubble or anywhere on the map. The photos taken nearest to it are listed here, closest first.</p>
         <p class="gallery-map-side-count">${counts}</p>
+        <div class="gallery-map-estimate" id="gallery-map-estimate"></div>
       </div>`;
+    _loadEstimate();
     return;
   }
   const pin = _mapPin;
@@ -1801,9 +1803,61 @@ async function _renderNearest() {
     async (offset) => (seq === _nearestSeq ? (await _jsonFetch(url(offset))).items || [] : []), tiles);
 }
 
+// Photos without a location placed where a photo taken at the same time was
+// (src/gallery_library/locations.py): offered in the map's side panel.
+async function _loadEstimate() {
+  const box = document.getElementById('gallery-map-estimate');
+  if (!box) return;
+  try {
+    _drawEstimate(box, await _jsonFetch('/api/gallery/locations/estimate'));
+  } catch (_) { /* the map works without it */ }
+}
+
+function _drawEstimate(box, d) {
+  let html = '';
+  if (d.possible) {
+    html += `<p>${_plural(d.possible, 'photo')} without a location ${d.possible === 1 ? 'was' : 'were'} taken within minutes of one that has it — by a camera next to your phone, say.</p>
+      <button type="button" class="memory-toolbar-btn" data-map-action="estimate" title="Each takes the spot of the photo with a location taken closest in time (at most 15 minutes, or an hour when you stayed in one place)">Place ${d.possible === 1 ? 'it' : 'them'} on the map</button>`;
+  }
+  if (d.estimated) {
+    html += `<p class="gallery-map-estimate-done">${_plural(d.estimated, 'photo')} ${d.estimated === 1 ? 'is' : 'are'} placed by the time ${d.estimated === 1 ? 'it was' : 'they were'} taken.
+      <button type="button" class="gallery-map-estimate-undo" data-map-action="unestimate">Remove these estimates</button></p>`;
+  }
+  box.innerHTML = html;
+}
+
+async function _runEstimate(place) {
+  const box = document.getElementById('gallery-map-estimate');
+  if (!place) {
+    const ok = await uiModule.styledConfirm(
+      'Remove every estimated location? Locations stored in the photos themselves stay.',
+      { confirmText: 'Remove', danger: true },
+    );
+    if (!ok) return;
+  }
+  box?.querySelectorAll('button').forEach(b => { b.disabled = true; });
+  try {
+    const data = await _jsonFetch('/api/gallery/locations/estimate', { method: place ? 'POST' : 'DELETE' });
+    uiModule.showToast?.(place
+      ? `Placed ${_plural(data.placed, 'photo')} by the time ${data.placed === 1 ? 'it was' : 'they were'} taken`
+      : `Removed ${_plural(data.cleared, 'estimated location')}`);
+    _tripsData = null;   // trips may change with them
+    _MAP.loadedAt = 0;
+    const note = document.getElementById('gallery-map-note');
+    if (note) await _loadMapPoints(note);
+    if (_MAP.map) _drawBubbles();
+    _MAP.listedFor = null;
+    _renderNearest();
+  } catch (err) {
+    uiModule.showError(err.message);
+    box?.querySelectorAll('button').forEach(b => { b.disabled = false; });
+  }
+}
+
 async function _onMapSideClick(e) {
   const action = e.target.closest('[data-map-action]')?.dataset.mapAction;
   if (action === 'clear') return _clearMapPin();
+  if (action === 'estimate' || action === 'unestimate') return _runEstimate(action === 'estimate');
   if (action === 'photos' && _mapPin) {
     const spot = { ..._mapPin };
     return _showPhotosFiltered(() => { _activeNear = spot; });
@@ -3783,7 +3837,7 @@ function _openDetail(img) {
         </div>
         ${editedHtml}
         ${img.camera ? `<div class="gallery-detail-section"><label>Camera</label><div>${_esc(img.camera)}</div></div>` : ''}
-        ${img.gps ? `<div class="gallery-detail-section"><label>Location</label><div>${_esc(img.gps.lat)}, ${_esc(img.gps.lng)}${typeof img.distance_km === 'number' ? ` <span class="gallery-detail-distance">· ${_esc(_formatDistance(img.distance_km))} away</span>` : ''}</div><div class="gallery-detail-mini-actions"><button class="gallery-detail-mini-btn" id="gallery-detail-show-map" title="Show where this photo was taken"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s7-6.2 7-12a7 7 0 0 0-14 0c0 5.8 7 12 7 12z"/><circle cx="12" cy="10" r="2.5"/></svg>Show on map</button><button class="gallery-detail-mini-btn" id="gallery-detail-nearby" title="All photos with a location, nearest to this one first"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="8"/></svg>Photos nearby</button></div></div>` : ''}
+        ${img.gps ? `<div class="gallery-detail-section"><label>Location${img.location_estimated ? ' <span class="gallery-detail-estimated" title="Not stored in the photo: taken from a photo with a location taken within minutes of this one">estimated</span>' : ''}</label><div>${_esc(img.gps.lat)}, ${_esc(img.gps.lng)}${typeof img.distance_km === 'number' ? ` <span class="gallery-detail-distance">· ${_esc(_formatDistance(img.distance_km))} away</span>` : ''}</div><div class="gallery-detail-mini-actions"><button class="gallery-detail-mini-btn" id="gallery-detail-show-map" title="Show where this photo was taken"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s7-6.2 7-12a7 7 0 0 0-14 0c0 5.8 7 12 7 12z"/><circle cx="12" cy="10" r="2.5"/></svg>Show on map</button><button class="gallery-detail-mini-btn" id="gallery-detail-nearby" title="All photos with a location, nearest to this one first"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="8"/></svg>Photos nearby</button></div></div>` : ''}
         ${aiTags ? `<div class="gallery-detail-section"><label>AI Tags</label><div class="gallery-ai-tags">${aiTags.split(',').map(t => t.trim()).filter(Boolean).map(t => `<button class="gallery-ai-chip gallery-aitag-chip" data-tag-filter="${_esc(t)}" title="AI-generated tag — click to filter to photos tagged “${_esc(t)}”"><span class="gallery-aitag-mark" aria-hidden="true">✦</span>${_esc(t)}</button>`).join('')}</div></div>` : ''}
         <div class="gallery-detail-section">
           <label>Tags</label>
