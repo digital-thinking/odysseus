@@ -546,6 +546,10 @@ _GALLERY_IMAGE_INDEXES = (
     "WHERE tags IS NOT NULL AND tags != ''",
     "CREATE INDEX IF NOT EXISTS ix_gallery_images_ai_tagged ON gallery_images (owner, is_active, id, source_id) "
     "WHERE ai_tags IS NOT NULL AND ai_tags != ''",
+    # The map and "nearest first" read only these columns of the photos with a location.
+    # Partial, so no query that does not ask for gps_lat IS NOT NULL can pick it.
+    "CREATE INDEX IF NOT EXISTS ix_gallery_images_located ON gallery_images "
+    "(owner, is_active, gps_lat, gps_lng, taken_at, id) WHERE gps_lat IS NOT NULL",
 )
 _GALLERY_FACE_INDEXES = (
     "CREATE INDEX IF NOT EXISTS ix_gallery_faces_owner_person ON gallery_faces "

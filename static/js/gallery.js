@@ -225,6 +225,7 @@ async function _fetchLibrary(append) {
   if (_activePeople.length) params.set('person', _activePeople.map(p => p.id).join(','));
   if (_activeExactTag) params.set('exact_tag', _activeExactTag);
   if (_activeSimilar) params.set('similar_to', _activeSimilar.id);
+  if (_activeNear) params.set('near', `${_activeNear.lat},${_activeNear.lng}`);
   if (_activeFolder) {
     params.set('source', _activeFolder.source);
     if (_activeFolder.path) params.set('folder', _activeFolder.path);
@@ -255,7 +256,7 @@ async function _fetchLibrary(append) {
     // Cache an "empty" verdict so the next open of an empty gallery doesn't
     // flash skeleton tiles before the real "No photos yet" message.
     try {
-      const _noFilters = !_search && !_activeTags.length && !_activeModel && !_activeAlbum && !_favoritesOnly && !_activeFolder && !_activePeople.length && !_activeExactTag && !_activeSimilar;
+      const _noFilters = !_search && !_activeTags.length && !_activeModel && !_activeAlbum && !_favoritesOnly && !_activeFolder && !_activePeople.length && !_activeExactTag && !_activeSimilar && !_activeNear;
       if (_noFilters) {
         if (_items.length === 0) localStorage.setItem('gallery-known-empty', '1');
         else localStorage.removeItem('gallery-known-empty');
@@ -923,7 +924,8 @@ async function _loadTagModelPicker() {
 let _activePeople = [];       // [{ id, name }] — Photos filter: photos showing all of them
 let _activeSimilar = null;     // { id, label } — Photos ranked by how much they look like this one
 let _activeExactTag = null;    // whole tag picked in the Tags tab — Photos filter
-let _peopleView = null;        // null = all people, { type: 'person', id } or { type: 'unknown' }
+let _activeNear = null;        // { lat, lng, label } — Photos with a location, nearest to this spot first
+let _peopleView = null;       // null = all people, { type: 'person', id } or { type: 'unknown' }
 let _faceOverlayCleanup = null;
 const _FACES_PAGE = 200;
 
@@ -938,6 +940,7 @@ function _resetPhotoFilters() {
   _activePeople = [];
   _activeExactTag = null;
   _activeSimilar = null;
+  _activeNear = null;
   const searchInput = document.getElementById('gallery-search');
   const modelSel = document.getElementById('gallery-model-filter');
   const folderSel = document.getElementById('gallery-folder-filter');
@@ -953,8 +956,9 @@ function _showPhotosFiltered(set) {
   set();
   const modal = document.getElementById('gallery-modal');
   modal?.querySelector('.gallery-tab[data-tab="images"]')?.click();
-  _fetchLibrary(false);
+  const loading = _fetchLibrary(false);
   _renderAlbums();
+  return loading;
 }
 
 // Loads further pages into a grid (faces, tags) as the user scrolls to its end.
@@ -1402,6 +1406,466 @@ async function _loadTags(c) {
     async (offset) => (seq === _tagsLoadSeq ? (await _jsonFetch(url(offset))).tags || [] : []), cards);
 }
 
+// ---- Map tab: where photos were taken, as bubbles sized by how many there are ----
+//
+// /api/gallery/map sends every spot with photos once; bubbles are worked out
+// here for each zoom level, so zooming and panning need no further requests.
+// The list beside the map is /api/gallery/library?near=…, nearest first.
+// Leaflet is loaded on first use. Map pictures come from OpenStreetMap's tile
+// server and place names from its Nominatim search (through our server).
+
+const _LEAFLET_JS = '/static/lib/leaflet/leaflet.js';
+const _LEAFLET_CSS = '/static/lib/leaflet/leaflet.css';
+const _OSM_TILES = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+const _OSM_ATTRIBUTION = '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributors';
+const _BUBBLE_MERGE_PX = 50;     // spots closer than this on screen share one bubble
+const _MAP_PAGE = 60;
+const _MAP_REFRESH_MS = 2 * 60 * 1000;
+let _leafletPromise = null;
+let _mapPin = null;              // { lat, lng, label } — what the list measures from; kept while the app is open
+let _mapView = null;             // { center, zoom } — where the map was, for the next visit
+let _nearestSeq = 0;
+const _MAP = {
+  map: null, bubbles: null, pinMarker: null, hoverMarker: null, resize: null,
+  points: null, located: 0, photos: 0, loadedAt: 0,
+  clusters: new Map(),           // zoom → bubbles
+  listedFor: null,               // pin the list was loaded for
+  listed: new Map(),             // id → photo shown in the list
+  pending: null,                 // { zoom } — fly to the pin once the map is up
+};
+
+// In the reader's number format: "3,4 km" and "4.227 km" in German.
+function _formatDistance(km) {
+  if (km < 1) return `${Math.round(km * 1000)} m`;
+  if (km < 10) return `${km.toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 })} km`;
+  return `${Math.round(km).toLocaleString()} km`;
+}
+
+function _loadAsset(kind, url) {
+  return new Promise((resolve, reject) => {
+    const el = document.createElement(kind);
+    if (kind === 'link') { el.rel = 'stylesheet'; el.href = url; } else { el.src = url; }
+    el.addEventListener('load', () => resolve(), { once: true });
+    el.addEventListener('error', () => reject(new Error(`Could not load ${url}`)), { once: true });
+    document.head.appendChild(el);
+  });
+}
+
+function _ensureLeaflet() {
+  if (window.L?.map) return Promise.resolve(window.L);
+  return (_leafletPromise ??= Promise.all([_loadAsset('link', _LEAFLET_CSS), _loadAsset('script', _LEAFLET_JS)])
+    .then(() => {
+      if (!window.L?.map) throw new Error('The map library did not load');
+      return window.L;
+    })
+    .catch((err) => { _leafletPromise = null; throw err; }));
+}
+
+function _destroyMap() {
+  _MAP.resize?.disconnect();
+  _MAP.map?.remove();
+  Object.assign(_MAP, { map: null, bubbles: null, pinMarker: null, hoverMarker: null, resize: null,
+    points: null, loadedAt: 0, clusters: new Map(), listedFor: null, listed: new Map(), pending: null });
+}
+
+// "Show on map" in a photo's details.
+function _showOnMap(spot) {
+  _mapPin = spot;
+  _MAP.pending = { zoom: 16 };
+  document.querySelector('#gallery-modal .gallery-tab[data-tab="map"]')?.click();
+}
+
+// OpenStreetMap's pictures are light; on a dark theme they are dimmed to match.
+function _themeIsDark() {
+  const m = getComputedStyle(document.body).backgroundColor.match(/\d+(\.\d+)?/g);
+  if (!m || m.length < 3) return true;
+  const [r, g, b] = m.map(Number);
+  return (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255 < 0.45;
+}
+
+function _renderMapTab() {
+  const c = document.getElementById('gallery-map-container');
+  if (!c) return;
+  if (!c.querySelector('.gallery-map-layout')) {
+    c.innerHTML = `
+      <div class="gallery-map-layout">
+        <div class="gallery-map-main">
+          <div id="gallery-map" class="gallery-map" role="application" aria-label="Map of where your photos were taken"></div>
+          <form class="gallery-map-search" id="gallery-map-search-form" role="search" autocomplete="off">
+            <input type="search" class="gallery-search" id="gallery-map-search" placeholder="Search a place or address…" aria-label="Search a place" maxlength="160" />
+            <div class="gallery-search-suggest gallery-map-places" id="gallery-map-places" hidden></div>
+          </form>
+          <div class="gallery-map-note" id="gallery-map-note" hidden></div>
+        </div>
+        <aside class="gallery-map-side" id="gallery-map-side" aria-live="polite"></aside>
+      </div>`;
+    _wireMapSearch(c);
+    c.querySelector('#gallery-map-side').addEventListener('click', _onMapSideClick);
+    c.querySelector('#gallery-map-side').addEventListener('mouseover', (e) => _hoverMapPhoto(e.target.closest('.gallery-map-photo')));
+    c.querySelector('#gallery-map-side').addEventListener('mouseleave', () => _hoverMapPhoto(null));
+  }
+  c.querySelector('.gallery-map').classList.toggle('gallery-map-dark', _themeIsDark());
+  _startMap(c);
+}
+
+async function _startMap(c) {
+  const note = c.querySelector('#gallery-map-note');
+  let L;
+  try {
+    L = await _ensureLeaflet();
+  } catch (e) {
+    note.hidden = false;
+    note.textContent = `${e.message}. Reload the page and try again.`;
+    return;
+  }
+  if (!c.isConnected) return;
+  const firstTime = !_MAP.map;
+  if (firstTime) _createMap(L, c.querySelector('#gallery-map'));
+  else _MAP.map.invalidateSize();
+  await _loadMapPoints(note);
+  if (!c.isConnected || !_MAP.map) return;
+  const map = _MAP.map;
+  if (_mapPin) _placePin();
+  const pending = _MAP.pending;
+  _MAP.pending = null;
+  if (pending && _mapPin) {
+    map.setView([_mapPin.lat, _mapPin.lng], Math.max(map.getZoom(), pending.zoom));
+  } else if (firstTime) {
+    if (_mapView) map.setView(_mapView.center, _mapView.zoom);
+    else if (_MAP.points?.length) {
+      const lats = _MAP.points.map(p => p[0]), lngs = _MAP.points.map(p => p[1]);
+      map.fitBounds([[Math.min(...lats), Math.min(...lngs)], [Math.max(...lats), Math.max(...lngs)]], { padding: [30, 30], maxZoom: 12 });
+    } else map.setView([30, 10], 2);
+  }
+  _drawBubbles();
+  _renderNearest();
+}
+
+function _createMap(L, el) {
+  const map = L.map(el, { minZoom: 2, maxZoom: 19, worldCopyJump: true });
+  // Only the site's origin goes along (the app sends no Referer at all
+  // otherwise), which OpenStreetMap's tile policy asks for.
+  L.tileLayer(_OSM_TILES, { maxZoom: 19, attribution: _OSM_ATTRIBUTION, referrerPolicy: 'strict-origin-when-cross-origin' }).addTo(map);
+  map.attributionControl.setPrefix('<a href="https://leafletjs.com" target="_blank" rel="noopener">Leaflet</a>');
+  _MAP.map = map;
+  _MAP.bubbles = L.layerGroup().addTo(map);
+  map.on('moveend', () => {
+    _mapView = { center: map.getCenter(), zoom: map.getZoom() };
+    _drawBubbles();
+  });
+  map.on('click', (e) => {
+    document.getElementById('gallery-map-places')?.setAttribute('hidden', '');
+    const at = e.latlng.wrap();
+    _setMapPin({ lat: at.lat, lng: at.lng, label: 'the marked spot' });
+  });
+  // The gallery window can be resized, tiled or maximised.
+  if ('ResizeObserver' in window) {
+    _MAP.resize = new ResizeObserver(() => _MAP.map?.invalidateSize({ debounceMoveend: true }));
+    _MAP.resize.observe(el);
+  }
+}
+
+async function _loadMapPoints(note) {
+  if (_MAP.points && Date.now() - _MAP.loadedAt < _MAP_REFRESH_MS) return;
+  let data;
+  try {
+    data = await _jsonFetch('/api/gallery/map');
+  } catch (e) {
+    note.hidden = false;
+    note.textContent = `Could not load photo locations: ${e.message}`;
+    return;
+  }
+  // Busiest spots first, so they anchor the bubbles around them.
+  _MAP.points = (data.points || []).sort((a, b) => b[2] - a[2]);
+  _MAP.located = data.located || 0;
+  _MAP.photos = data.photos || 0;
+  _MAP.loadedAt = Date.now();
+  _MAP.clusters = new Map();
+  note.hidden = _MAP.located > 0;
+  note.innerHTML = _MAP.located ? '' : 'None of your photos has a location yet. Phones and GPS cameras store where a photo was taken; Odysseus reads it when the photo is uploaded or its library folder is scanned.';
+}
+
+// Spots that would overlap on screen at this zoom become one bubble, placed
+// at their photos' centre. Worked out once per zoom level.
+function _clustersAt(zoom) {
+  const cached = _MAP.clusters.get(zoom);
+  if (cached) return cached;
+  const R = _BUBBLE_MERGE_PX;
+  const grid = new Map();
+  const out = [];
+  for (const [lat, lng, n] of _MAP.points || []) {
+    const p = _MAP.map.project([lat, lng], zoom);
+    const gx = Math.floor(p.x / R), gy = Math.floor(p.y / R);
+    let best = null, bestD = R * R;
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        for (const c of grid.get(`${gx + dx},${gy + dy}`) || []) {
+          const d = (c.x - p.x) ** 2 + (c.y - p.y) ** 2;
+          if (d < bestD) { bestD = d; best = c; }
+        }
+      }
+    }
+    if (!best) {
+      best = { x: p.x, y: p.y, n: 0, spots: 0, sx: 0, sy: 0, south: lat, north: lat, west: lng, east: lng };
+      const key = `${gx},${gy}`;
+      if (!grid.has(key)) grid.set(key, []);
+      grid.get(key).push(best);
+      out.push(best);
+    }
+    best.n += n;
+    best.spots += 1;
+    best.sx += p.x * n;
+    best.sy += p.y * n;
+    best.south = Math.min(best.south, lat); best.north = Math.max(best.north, lat);
+    best.west = Math.min(best.west, lng); best.east = Math.max(best.east, lng);
+  }
+  for (const c of out) c.center = _MAP.map.unproject([c.sx / c.n, c.sy / c.n], zoom);
+  _MAP.clusters.set(zoom, out);
+  return out;
+}
+
+// More photos, bigger bubble: 16 px for one photo, 72 px for 10,000.
+function _bubbleSize(n) { return Math.round(2 * (8 + 7 * Math.log10(n))); }
+
+function _bubbleLabel(n) {
+  if (n < 1000) return String(n);
+  if (n < 10000) return `${(n / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+  return `${Math.round(n / 1000)}k`;
+}
+
+function _drawBubbles() {
+  const { map, bubbles } = _MAP;
+  if (!map || !bubbles || !_MAP.points) return;
+  const L = window.L;
+  const view = map.getBounds().pad(0.3);
+  bubbles.clearLayers();
+  for (const c of _clustersAt(map.getZoom())) {
+    if (!view.contains(c.center)) continue;
+    const size = _bubbleSize(c.n);
+    const marker = L.marker(c.center, {
+      icon: L.divIcon({
+        className: 'gallery-map-bubble-icon',
+        html: `<span class="gallery-map-bubble" style="width:${size}px;height:${size}px;font-size:${Math.max(10, Math.round(size * 0.3))}px">${_bubbleLabel(c.n)}</span>`,
+        iconSize: [size, size],
+      }),
+      title: `${c.n.toLocaleString()} photo${c.n === 1 ? '' : 's'}`,
+      zIndexOffset: -Math.min(c.n, 100000),   // smaller bubbles stay clickable on top of big ones
+      riseOnHover: true,
+    });
+    marker.on('click', () => _openBubble(c));
+    bubbles.addLayer(marker);
+  }
+}
+
+// A bubble that zooming in would split: zoom in. Either way the list shows
+// the photos nearest to its centre.
+function _openBubble(c) {
+  const map = _MAP.map;
+  const bounds = window.L.latLngBounds([c.south, c.west], [c.north, c.east]);
+  const fits = Math.min(map.getBoundsZoom(bounds, false, window.L.point(80, 80)), map.getMaxZoom());
+  if (c.spots > 1 && fits > map.getZoom()) map.flyToBounds(bounds, { padding: [40, 40], maxZoom: fits, duration: 0.6 });
+  _setMapPin({ lat: c.center.lat, lng: c.center.lng, label: 'the marked spot' });
+}
+
+function _setMapPin(spot, view = {}) {
+  _mapPin = spot;
+  const map = _MAP.map;
+  if (map) {
+    _placePin();
+    if (view.bbox) {
+      const [south, north, west, east] = view.bbox;
+      map.flyToBounds([[south, west], [north, east]], { maxZoom: 15, duration: 0.8 });
+    } else if (view.zoom) {
+      map.flyTo([spot.lat, spot.lng], Math.max(map.getZoom(), view.zoom), { duration: 0.8 });
+    }
+  }
+  _renderNearest();
+}
+
+function _placePin() {
+  const L = window.L;
+  if (!_MAP.map || !_mapPin || !L) return;
+  const at = [_mapPin.lat, _mapPin.lng];
+  if (_MAP.pinMarker) { _MAP.pinMarker.setLatLng(at); return; }
+  _MAP.pinMarker = L.marker(at, {
+    icon: L.divIcon({
+      className: 'gallery-map-pin-icon',
+      html: '<svg width="28" height="36" viewBox="0 0 28 36" aria-hidden="true"><path d="M14 35s12-11.3 12-21A12 12 0 0 0 2 14c0 9.7 12 21 12 21z"/><circle cx="14" cy="14" r="4.5"/></svg>',
+      iconSize: [28, 36],
+      iconAnchor: [14, 35],
+    }),
+    interactive: false,
+    keyboard: false,
+    zIndexOffset: 200000,
+  }).addTo(_MAP.map);
+}
+
+function _clearMapPin() {
+  _mapPin = null;
+  _MAP.pinMarker?.remove();
+  _MAP.pinMarker = null;
+  _renderNearest();
+}
+
+function _hoverMapPhoto(tile) {
+  const L = window.L;
+  _MAP.hoverMarker?.remove();
+  _MAP.hoverMarker = null;
+  const img = tile && _MAP.listed.get(tile.dataset.id);
+  if (!img?.gps || !_MAP.map || !L) return;
+  _MAP.hoverMarker = L.circleMarker([Number(img.gps.lat), Number(img.gps.lng)], {
+    radius: 9, weight: 3, className: 'gallery-map-hover', interactive: false,
+  }).addTo(_MAP.map);
+}
+
+// The list beside the map: every photo with a location, nearest to the pin first.
+async function _renderNearest() {
+  const side = document.getElementById('gallery-map-side');
+  if (!side) return;
+  const key = _mapPin ? `${_mapPin.lat},${_mapPin.lng}` : '';
+  if (key === _MAP.listedFor && side.childElementCount) return;
+  _MAP.listedFor = key;
+  // A place typed in the search box stays only while the list is for that place.
+  const box = document.getElementById('gallery-map-search');
+  if (box && box.value.trim() !== (_mapPin?.label || '')) box.value = '';
+  _MAP.listed = new Map();
+  _hoverMapPhoto(null);
+  const seq = ++_nearestSeq;
+  const counts = _MAP.located
+    ? `${_MAP.located.toLocaleString()} of ${_MAP.photos.toLocaleString()} photos have a location.`
+    : '';
+  if (!_mapPin) {
+    side.innerHTML = `<div class="gallery-map-side-empty">
+        <strong>Find photos by place</strong>
+        <p>Search for a place, or click a bubble or anywhere on the map. The photos taken nearest to it are listed here, closest first.</p>
+        <p class="gallery-map-side-count">${counts}</p>
+      </div>`;
+    return;
+  }
+  const pin = _mapPin;
+  const url = (offset) => `/api/gallery/library?near=${encodeURIComponent(`${pin.lat},${pin.lng}`)}&offset=${offset}&limit=${_MAP_PAGE}`;
+  side.innerHTML = `
+    <div class="gallery-map-side-head">
+      <div class="gallery-map-side-title">Nearest to <strong>${_esc(pin.label)}</strong></div>
+      <button class="gallery-map-side-clear" data-map-action="clear" title="Remove the pin" aria-label="Remove the pin">×</button>
+      <div class="gallery-map-side-sub">${pin.lat.toFixed(5)}, ${pin.lng.toFixed(5)}</div>
+      <button class="memory-toolbar-btn gallery-map-side-open" data-map-action="photos" title="Show this list in Photos, where you can select, download and browse them">Open in Photos</button>
+    </div>
+    <div class="gallery-map-photos"><div class="gallery-people-empty">Loading…</div></div>`;
+  let data;
+  try {
+    data = await _jsonFetch(url(0));
+  } catch (e) {
+    if (seq === _nearestSeq) side.querySelector('.gallery-map-photos').innerHTML = `<div class="gallery-people-empty">${_esc(e.message)}</div>`;
+    return;
+  }
+  if (seq !== _nearestSeq) return;   // the pin moved on while this was loading
+  const grid = side.querySelector('.gallery-map-photos');
+  const items = data.items || [];
+  if (!items.length) {
+    grid.innerHTML = '<div class="gallery-people-empty">None of your photos has a location yet.</div>';
+    return;
+  }
+  const tiles = (list) => list.map((img) => {
+    _MAP.listed.set(img.id, img);
+    const name = (img.source_path || img.prompt || img.filename || '').split('/').pop();
+    const when = img.taken_at ? new Date(img.taken_at).toLocaleDateString() : '';
+    return `
+      <button class="gallery-map-photo" data-id="${_esc(img.id)}" title="${_esc([name, when].filter(Boolean).join(' · '))}">
+        <img src="${_esc(img.thumb_url || img.url)}" alt="" loading="lazy" />
+        <span class="gallery-map-photo-distance">${_esc(_formatDistance(img.distance_km ?? 0))}</span>
+      </button>`;
+  }).join('');
+  grid.innerHTML = tiles(items);
+  const sub = side.querySelector('.gallery-map-side-sub');
+  if (sub) sub.textContent += ` · ${(data.total || 0).toLocaleString()} photos, closest first`;
+  _pagedGrid(side, grid, data.total || items.length, items.length,
+    async (offset) => (seq === _nearestSeq ? (await _jsonFetch(url(offset))).items || [] : []), tiles);
+}
+
+async function _onMapSideClick(e) {
+  const action = e.target.closest('[data-map-action]')?.dataset.mapAction;
+  if (action === 'clear') return _clearMapPin();
+  if (action === 'photos' && _mapPin) {
+    const spot = { ..._mapPin };
+    return _showPhotosFiltered(() => { _activeNear = spot; });
+  }
+  const tile = e.target.closest('.gallery-map-photo');
+  const img = tile && _MAP.listed.get(tile.dataset.id);
+  if (!img || !_mapPin) return;
+  // Open it in Photos with the same nearest-first list, so ← → keep walking outwards.
+  const spot = { ..._mapPin };
+  await _showPhotosFiltered(() => { _activeNear = spot; });
+  _openDetail(_items.find(i => i.id === img.id) || img);
+}
+
+function _wireMapSearch(c) {
+  const form = c.querySelector('#gallery-map-search-form');
+  const input = c.querySelector('#gallery-map-search');
+  const list = c.querySelector('#gallery-map-places');
+  let places = [];
+  let active = 0;
+  let searched = '';
+  let seq = 0;
+
+  const pick = (place) => {
+    list.hidden = true;
+    input.value = place.name;
+    _setMapPin({ lat: place.lat, lng: place.lng, label: place.name },
+      place.bbox ? { bbox: place.bbox } : { zoom: 15 });
+  };
+  const show = () => {
+    list.innerHTML = places.map((p, i) => `
+      <button type="button" class="gallery-suggest-item${i === active ? ' active' : ''}" data-i="${i}">
+        <span class="gallery-suggest-name">${_esc(p.name)}</span>
+        <span class="gallery-suggest-count gallery-map-place-label">${_esc(p.label === p.name ? '' : p.label)}</span>
+      </button>`).join('') + '<div class="gallery-suggest-head gallery-map-places-credit">Search by OpenStreetMap Nominatim</div>';
+    list.hidden = false;
+  };
+  const search = async (text) => {
+    const mine = ++seq;
+    searched = text;
+    list.innerHTML = '<div class="gallery-suggest-head">Searching…</div>';
+    list.hidden = false;
+    try {
+      const data = await _jsonFetch(`/api/gallery/places?q=${encodeURIComponent(text)}`);
+      if (mine !== seq) return;
+      places = data.places || [];
+      active = 0;
+      if (places.length === 1) return pick(places[0]);
+      if (!places.length) {
+        list.innerHTML = `<div class="gallery-suggest-head">No place called “${_esc(text)}” found</div>`;
+        return;
+      }
+      show();
+    } catch (err) {
+      if (mine === seq) list.innerHTML = `<div class="gallery-suggest-head">${_esc(err.message)}</div>`;
+    }
+  };
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const text = input.value.trim();
+    if (!text) return;
+    // Enter on a list that is already up picks the highlighted place.
+    if (!list.hidden && places.length && text === searched) return pick(places[active]);
+    search(text);
+  });
+  input.addEventListener('keydown', (e) => {
+    if (list.hidden || !places.length || (e.key !== 'ArrowDown' && e.key !== 'ArrowUp')) return;
+    e.preventDefault();
+    active = (active + (e.key === 'ArrowDown' ? 1 : places.length - 1)) % places.length;
+    show();
+  });
+  input.addEventListener('input', () => { if (!input.value.trim()) list.hidden = true; });
+  list.addEventListener('mousedown', (e) => e.preventDefault());   // keep focus in the box
+  list.addEventListener('click', (e) => {
+    const item = e.target.closest('.gallery-suggest-item');
+    if (item) pick(places[Number(item.dataset.i)]);
+  });
+  c.addEventListener('click', (e) => { if (!e.target.closest('.gallery-map-search')) list.hidden = true; });
+}
+
 function _renderAlbums() {
   const container = document.getElementById('gallery-album-chips');   // above search: active-filter indicators
   const filterC = document.getElementById('gallery-filter-chips');    // below search: All / Favorites
@@ -1420,6 +1884,7 @@ function _renderAlbums() {
     if (_activeFolder) fhtml += _filterPill('Folder', _activeFolder.label || _activeFolder.path, 'data-clear="folder"');
     _activePeople.forEach(p => { fhtml += _filterPill('Person', p.name, `data-clear-person="${_esc(p.id)}"`); });
     if (_activeSimilar) fhtml += _filterPill('Similar', `Similar to ${_activeSimilar.label}`, 'data-clear="similar"');
+    if (_activeNear) fhtml += _filterPill('Near', `📍 Nearest to ${_activeNear.label}`, 'data-clear="near"');
     if (_activeExactTag) fhtml += _filterPill('Tag', `#${_activeExactTag}`, 'data-clear="exact-tag"');
     if (_activeModel) fhtml += _filterPill('Source', _activeModel, 'data-clear="model"');
     _activeTags.forEach(t => {
@@ -1431,7 +1896,7 @@ function _renderAlbums() {
         fhtml += _filterPill('Album', a.name, 'data-clear="album"');
       }
     }
-    if (_search || _activeTags.length || _activeModel || _activeAlbum || _favoritesOnly || _activeFolder || _activePeople.length || _activeExactTag || _activeSimilar) {
+    if (_search || _activeTags.length || _activeModel || _activeAlbum || _favoritesOnly || _activeFolder || _activePeople.length || _activeExactTag || _activeSimilar || _activeNear) {
       fhtml += `<button class="gallery-chip gallery-clear-all-filters" data-clear="all" title="Clear every gallery filter">Clear all</button>`;
     }
     filterC.innerHTML = fhtml;
@@ -1483,6 +1948,12 @@ function _renderAlbums() {
       _fetchLibrary(false);
       _renderAlbums();
     });
+    filterC.querySelector('.gallery-chip-clear[data-clear="near"]')?.addEventListener('click', (e) => {
+      e.stopPropagation();
+      _activeNear = null;
+      _fetchLibrary(false);
+      _renderAlbums();
+    });
     filterC.querySelector('.gallery-chip-clear[data-clear="folder"]')?.addEventListener('click', (e) => {
       e.stopPropagation();
       _setFolderFilter('');
@@ -1513,6 +1984,16 @@ function _renderAlbums() {
   }
   // The above-search row is no longer used — all filter chips live below now.
   if (container) container.innerHTML = '';
+  _syncSortSelect();
+}
+
+// "Nearest to …" orders by distance, so the sort menu shows that and waits.
+function _syncSortSelect() {
+  const sel = document.getElementById('gallery-sort');
+  if (!sel) return;
+  sel.disabled = !!_activeNear;
+  sel.title = _activeNear ? 'Sorted by distance while “Nearest to …” is on' : '';
+  sel.value = _activeNear ? 'nearest' : _sort;
 }
 
 // Albums tab — renders the album list as a grid of cover-thumbnailed cards.
@@ -2397,7 +2878,9 @@ function _renderGrid() {
         <div class="gallery-card-info">
           <div class="gallery-card-prompt">${_esc(promptPreview)}</div>
           <div class="gallery-card-meta">
-            ${sourceLabel ? `<span class="gallery-card-model">${_esc(sourceLabel)}</span>` : ''}
+            ${typeof img.distance_km === 'number'
+              ? `<span class="gallery-card-model gallery-card-distance" title="Distance from ${_esc(_activeNear?.label || 'the chosen spot')}">📍 ${_esc(_formatDistance(img.distance_km))}</span>`
+              : (sourceLabel ? `<span class="gallery-card-model">${_esc(sourceLabel)}</span>` : '')}
             <span class="gallery-card-date">${date}</span>
           </div>
         </div>
@@ -2624,7 +3107,7 @@ function _openDetail(img) {
         </div>
         ${editedHtml}
         ${img.camera ? `<div class="gallery-detail-section"><label>Camera</label><div>${_esc(img.camera)}</div></div>` : ''}
-        ${img.gps ? `<div class="gallery-detail-section"><label>Location</label><div>${img.gps.lat}, ${img.gps.lng}</div></div>` : ''}
+        ${img.gps ? `<div class="gallery-detail-section"><label>Location</label><div>${_esc(img.gps.lat)}, ${_esc(img.gps.lng)}${typeof img.distance_km === 'number' ? ` <span class="gallery-detail-distance">· ${_esc(_formatDistance(img.distance_km))} away</span>` : ''}</div><div class="gallery-detail-mini-actions"><button class="gallery-detail-mini-btn" id="gallery-detail-show-map" title="Show where this photo was taken"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 22s7-6.2 7-12a7 7 0 0 0-14 0c0 5.8 7 12 7 12z"/><circle cx="12" cy="10" r="2.5"/></svg>Show on map</button><button class="gallery-detail-mini-btn" id="gallery-detail-nearby" title="All photos with a location, nearest to this one first"><svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><circle cx="12" cy="12" r="8"/></svg>Photos nearby</button></div></div>` : ''}
         ${aiTags ? `<div class="gallery-detail-section"><label>AI Tags</label><div class="gallery-ai-tags">${aiTags.split(',').map(t => t.trim()).filter(Boolean).map(t => `<button class="gallery-ai-chip gallery-aitag-chip" data-tag-filter="${_esc(t)}" title="AI-generated tag — click to filter to photos tagged “${_esc(t)}”"><span class="gallery-aitag-mark" aria-hidden="true">✦</span>${_esc(t)}</button>`).join('')}</div></div>` : ''}
         <div class="gallery-detail-section">
           <label>Tags</label>
@@ -2705,6 +3188,15 @@ function _openDetail(img) {
   document.getElementById('gallery-detail-similar')?.addEventListener('click', () => {
     const label = (img.source_path || img.prompt || 'this photo').split('/').pop();
     _showPhotosFiltered(() => { _activeSimilar = { id: img.id, label }; });
+  });
+  const _photoSpot = () => ({
+    lat: Number(img.gps.lat), lng: Number(img.gps.lng),
+    label: (img.source_path || img.prompt || img.filename || 'this photo').split('/').pop(),
+  });
+  document.getElementById('gallery-detail-show-map')?.addEventListener('click', () => _showOnMap(_photoSpot()));
+  document.getElementById('gallery-detail-nearby')?.addEventListener('click', () => {
+    const spot = _photoSpot();
+    _showPhotosFiltered(() => { _activeNear = spot; });
   });
   document.getElementById('gallery-detail-copy-prompt')?.addEventListener('click', async (event) => {
     const text = img.prompt || '';
@@ -3269,6 +3761,10 @@ export function openGallery() {
           <span class="gallery-tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20.59 13.41l-7.17 7.17a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></svg></span>
           <span class="gallery-tab-label">Tags</span>
         </button>
+        <button class="gallery-tab" data-tab="map">
+          <span class="gallery-tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/></svg></span>
+          <span class="gallery-tab-label">Map</span>
+        </button>
         <button class="gallery-tab" data-tab="albums">
           <span class="gallery-tab-icon"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg></span>
           <span class="gallery-tab-label">Albums</span>
@@ -3311,6 +3807,7 @@ export function openGallery() {
             <option value="oldest"${_sort === 'oldest' ? ' selected' : ''}>↑ Oldest first</option>
             <option value="taken_desc"${_sort === 'taken_desc' ? ' selected' : ''}>↓ Date taken</option>
             <option value="taken_asc"${_sort === 'taken_asc' ? ' selected' : ''}>↑ Date taken</option>
+            <option value="nearest" hidden>📍 Nearest first</option>
           </select>
           <button class="gallery-select-btn gallery-toolbar-action" id="gallery-select-btn" title="Select for bulk actions" style="position:relative;top:0;"><span>Select</span></button>
         </div>
@@ -3330,6 +3827,7 @@ export function openGallery() {
         <div class="gallery-albums-container" id="gallery-albums-container" style="display:none;"></div>
         <div class="gallery-people-container" id="gallery-people-container" style="display:none;"></div>
         <div class="gallery-people-container gallery-tags-container" id="gallery-tags-container" style="display:none;"></div>
+        <div class="gallery-map-container" id="gallery-map-container" style="display:none;"></div>
         <div class="gallery-editor-container" id="gallery-editor-container" style="display:none;"></div>
         <div class="gallery-settings-container" id="gallery-settings-container" style="display:none;">
           <div class="admin-card" id="gallery-library-card" style="display:none;">
@@ -3496,6 +3994,8 @@ export function openGallery() {
       if (peopleContainer) peopleContainer.style.display = target === 'people' ? '' : 'none';
       const tagsContainer = document.getElementById('gallery-tags-container');
       if (tagsContainer) tagsContainer.style.display = target === 'tags' ? '' : 'none';
+      const mapContainer = document.getElementById('gallery-map-container');
+      if (mapContainer) mapContainer.style.display = target === 'map' ? '' : 'none';
       if (editorContainer) editorContainer.style.display = target === 'editor' ? 'flex' : 'none';
       if (settingsContainer) settingsContainer.style.display = target === 'settings' ? '' : 'none';
       if (target === 'images') {
@@ -3508,6 +4008,8 @@ export function openGallery() {
         _renderPeopleTab();
       } else if (target === 'tags') {
         _renderTagsTab();
+      } else if (target === 'map') {
+        _renderMapTab();
       } else if (target === 'settings') {
         _loadLibrarySources();
         _loadTagModelPicker();
@@ -4308,6 +4810,8 @@ function _showImagesTab() {
   if (peopleContainer) peopleContainer.style.display = 'none';
   const tagsContainer = document.getElementById('gallery-tags-container');
   if (tagsContainer) tagsContainer.style.display = 'none';
+  const mapContainer = document.getElementById('gallery-map-container');
+  if (mapContainer) mapContainer.style.display = 'none';
 }
 
 export async function openGalleryImage(imageId) {
@@ -4322,11 +4826,12 @@ export async function openGalleryImage(imageId) {
   _activeModel = null;
   _activeAlbum = null;
   _favoritesOnly = false;
+  _activeNear = null;
   _sort = 'recent';
   const searchInput = document.getElementById('gallery-search');
   if (searchInput) searchInput.value = '';
   const sortSel = document.getElementById('gallery-sort');
-  if (sortSel) sortSel.value = 'recent';
+  if (sortSel) { sortSel.value = 'recent'; sortSel.disabled = false; }
   const detail = document.getElementById('gallery-detail');
   if (detail) detail.style.display = 'none';
 
@@ -4371,6 +4876,7 @@ function _doCloseGallery() {
   }
   // Detach the face-overlay resize listener so we don't leak a
   // handler past close (v2 review HIGH-9).
+  _destroyMap();
   closeEditor();
   window.__galleryAllowCloseEditor = false;
 

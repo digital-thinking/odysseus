@@ -1532,3 +1532,98 @@ body.gallery-selecting .gallery-dl-btn,
   background: rgba(0, 0, 0, 0.65); color: #fff;
 }
 .gallery-person-chip.unknown { font-style: italic; opacity: 0.8; }
+
+/* ---- Map tab: bubbles where photos were taken, nearest photos beside it ---- */
+.gallery-map-container { padding: 6px 2px; container-type: inline-size; }
+.gallery-map-layout {
+  display: grid; grid-template-columns: minmax(0, 1fr) minmax(220px, 34%); gap: 10px;
+  height: min(70vh, 760px);
+}
+.gallery-map-main {
+  position: relative; isolation: isolate; min-height: 0; overflow: hidden;
+  border: 1px solid var(--border); border-radius: 10px; background: var(--panel);
+}
+.gallery-map { position: absolute; inset: 0; background: var(--panel); }
+.gallery-map.leaflet-container { font: inherit; font-size: 12px; }
+.gallery-map-dark .leaflet-tile-pane { filter: invert(1) hue-rotate(180deg) brightness(0.92) contrast(0.88) saturate(0.6); }
+/* .leaflet-container doubles the class so these win over leaflet.css, which loads later. */
+.gallery-map.leaflet-container .leaflet-bar { border: 1px solid var(--border); box-shadow: 0 2px 8px rgba(0, 0, 0, 0.25); }
+.gallery-map.leaflet-container .leaflet-bar a {
+  background: var(--bg); color: var(--fg); border-bottom-color: var(--border);
+}
+.gallery-map.leaflet-container .leaflet-bar a:hover { background: color-mix(in srgb, var(--fg) 10%, var(--bg)); }
+.gallery-map.leaflet-container .leaflet-bar a.leaflet-disabled { background: var(--bg); color: var(--fg); opacity: 0.35; }
+.gallery-map.leaflet-container .leaflet-control-attribution {
+  background: color-mix(in srgb, var(--bg) 82%, transparent); color: var(--fg); font-size: 10px;
+}
+.gallery-map.leaflet-container .leaflet-control-attribution a { color: inherit; text-decoration: underline; }
+.gallery-map-search { position: absolute; top: 10px; left: 52px; right: 10px; max-width: 380px; z-index: 1000; margin: 0; }
+.gallery-search#gallery-map-search {
+  top: 0; padding: 6px 10px; font-size: 12px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+}
+.gallery-map-places .gallery-suggest-item { flex-wrap: wrap; row-gap: 0; }
+.gallery-map-places .gallery-suggest-name { flex: 1 1 100%; }
+.gallery-map-place-label { flex: 1 1 100%; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gallery-map-place-label:empty { display: none; }
+.gallery-map-places-credit { padding-top: 6px; text-transform: none; letter-spacing: 0; }
+.gallery-map-note {
+  position: absolute; left: 50%; bottom: 30px; transform: translateX(-50%); z-index: 1000;
+  width: max-content; max-width: calc(100% - 40px); padding: 8px 12px; border-radius: 8px;
+  background: var(--bg); border: 1px solid var(--border); box-shadow: 0 4px 16px rgba(0, 0, 0, 0.3);
+  font-size: 12px; line-height: 1.45;
+}
+.gallery-map-note[hidden] { display: none; }
+
+.gallery-map-bubble-icon { background: none; border: none; }
+.gallery-map-bubble {
+  display: flex; align-items: center; justify-content: center; box-sizing: border-box;
+  border-radius: 50%; border: 2px solid rgba(255, 255, 255, 0.92);
+  background: radial-gradient(circle at 35% 30%, color-mix(in srgb, var(--red) 62%, #fff), var(--red) 72%);
+  color: #fff; font-weight: 700; line-height: 1; text-shadow: 0 1px 2px rgba(0, 0, 0, 0.45);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35); opacity: 0.93; cursor: pointer;
+  transition: transform 0.12s ease, opacity 0.12s ease;
+}
+.gallery-map-bubble-icon:hover .gallery-map-bubble { transform: scale(1.1); opacity: 1; }
+.gallery-map-bubble-icon:focus-visible { outline: none; }
+.gallery-map-bubble-icon:focus-visible .gallery-map-bubble { box-shadow: 0 0 0 3px var(--hl-function); }
+.gallery-map-pin-icon { background: none; border: none; }
+.gallery-map-pin-icon svg { display: block; overflow: visible; filter: drop-shadow(0 2px 3px rgba(0, 0, 0, 0.45)); }
+.gallery-map-pin-icon path { fill: var(--hl-function); stroke: #fff; stroke-width: 2; }
+.gallery-map-pin-icon circle { fill: #fff; }
+path.gallery-map-hover { stroke: #fff; fill: var(--hl-function); fill-opacity: 0.95; }
+
+.gallery-map-side { min-height: 0; overflow-y: auto; overscroll-behavior: contain; padding-right: 2px; }
+.gallery-map-side-head {
+  position: sticky; top: 0; z-index: 1; display: grid; grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center; gap: 2px 6px; padding: 2px 0 8px; background: var(--bg);
+}
+.gallery-map-side-title { font-size: 13px; overflow-wrap: anywhere; }
+.gallery-map-side-sub { grid-column: 1 / -1; font-size: 10px; opacity: 0.6; }
+.gallery-map-side-open { grid-column: 1 / -1; justify-self: start; margin-top: 6px; }
+.gallery-map-side-clear {
+  width: 24px; height: 24px; padding: 0; border: none; border-radius: 50%; background: none;
+  color: var(--fg); font-size: 17px; line-height: 1; opacity: 0.6; cursor: pointer;
+}
+.gallery-map-side-clear:hover { opacity: 1; background: color-mix(in srgb, var(--fg) 10%, transparent); }
+.gallery-map-side-empty { padding: 18px 8px; font-size: 12px; line-height: 1.5; }
+.gallery-map-side-empty p { margin: 6px 0 0; opacity: 0.75; }
+.gallery-map-side-count { font-size: 11px; opacity: 0.6 !important; }
+.gallery-map-photos { display: grid; grid-template-columns: repeat(auto-fill, minmax(92px, 1fr)); gap: 6px; }
+.gallery-map-photos .gallery-people-empty { grid-column: 1 / -1; }
+.gallery-map-photo {
+  position: relative; display: block; width: 100%; height: auto; aspect-ratio: 1; min-width: 0; padding: 0; border: none; border-radius: 8px;
+  overflow: hidden; background: var(--border); cursor: pointer;
+}
+.gallery-map-photo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.gallery-map-photo:hover, .gallery-map-photo:focus-visible { outline: 2px solid var(--hl-function); outline-offset: -2px; }
+.gallery-map-photo-distance {
+  position: absolute; left: 4px; bottom: 4px; padding: 1px 5px; border-radius: 4px;
+  background: rgba(0, 0, 0, 0.62); color: #fff; font-size: 10px; font-weight: 600; white-space: nowrap;
+}
+.gallery-map-photos + .gallery-load-more { margin: 10px auto 4px; display: block; }
+.gallery-detail-distance { opacity: 0.65; }
+@container (max-width: 640px) {
+  .gallery-map-layout { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(300px, 55vh) auto; height: auto; }
+  .gallery-map-side { overflow: visible; }
+}

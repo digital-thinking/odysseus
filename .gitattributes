@@ -25,6 +25,8 @@ static/js/actionMenuOrder.js text eol=lf
 # the whitespace check off for that tree instead, and keep the bundles out of
 # GitHub's language statistics.
 static/lib/** -whitespace linguist-vendored
+# Leaflet's published stylesheet has CRLF line endings; store it as shipped.
+static/lib/leaflet/leaflet.css -text
 
 # Binary assets — never normalize.
 *.png  binary

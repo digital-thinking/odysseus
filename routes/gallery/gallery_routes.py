@@ -37,6 +37,7 @@ from routes.gallery.gallery_helpers import (
     GalleryPatch, _extract_exif, _image_to_dict, _image_urls, _owner_filter, _human_size,
 )
 from routes.gallery.library_routes import register_library_routes
+from routes.gallery.map_routes import parse_point, rank_by_distance, register_map_routes
 from routes.gallery.people_routes import register_people_routes
 from routes.gallery import tag_stats
 from routes.gallery.tag_stats import tag_key as _tag_key
@@ -909,6 +910,7 @@ def setup_gallery_routes() -> APIRouter:
     # win over the /api/gallery/{image_id} catch-all below.
     register_library_routes(router)
     register_people_routes(router)
+    register_map_routes(router)
 
     def _image_file(img, db) -> Path:
         """Original file of any gallery row (library source or generated_images). Read-only use."""
@@ -1280,8 +1282,13 @@ def setup_gallery_routes() -> APIRouter:
         person: Optional[str] = Query(None),
         exact_tag: Optional[str] = Query(None),
         similar_to: Optional[str] = Query(None),
+        near: Optional[str] = Query(None),
     ) -> Dict[str, Any]:
         user = get_current_user(request)
+        # "lat,lng": only photos with a location, nearest first (other filters still apply).
+        origin = parse_point(near) if near else None
+        if near and origin is None:
+            raise HTTPException(400, "near must be 'latitude,longitude'")
         db = SessionLocal()
         try:
             # Distinct tags for filter UI
@@ -1414,27 +1421,49 @@ def setup_gallery_routes() -> APIRouter:
                     q = q.filter(GalleryImage.source_relpath.like(
                         f"{escape_like_pattern(folder_path)}/%", escape="\\"))
 
-            # Total before pagination
-            total = q.with_entities(func.count(GalleryImage.id)).scalar()
+            if origin is not None:
+                q = q.filter(GalleryImage.gps_lat.isnot(None))   # ix_gallery_images_located
+
+            def page_rows(page_ids):
+                """(photo, session name) of these ids, in this order."""
+                if not page_ids:
+                    return []
+                found = (
+                    db.query(GalleryImage, DbSession.name)
+                    .outerjoin(DbSession, GalleryImage.session_id == DbSession.id)
+                    .filter(GalleryImage.id.in_(page_ids))
+                    .all()
+                )
+                by_id = {img.id: (img, session_name) for img, session_name in found}
+                return [by_id[i] for i in page_ids if i in by_id]
+
+            # Total before pagination (by distance: counted while ranking)
+            total = q.with_entities(func.count(GalleryImage.id)).scalar() if origin is None else 0
             # How many of those have AI tags — surfaced as "X/Y photos tagged"
             # in the AI-tagging settings header. Only the first page needs it.
             total_tagged = None
-            if offset == 0:
+            if offset == 0 and origin is None:
                 total_tagged = q.filter(_HAS_AI_TAGS).with_entities(func.count(GalleryImage.id)).scalar()
 
             # Sorting
-            if ranked_ids is not None:
+            distances = None
+            if origin is not None:
+                # Nearest first, worked out on the few columns of the location index.
+                ranked = rank_by_distance(q.with_entities(
+                    GalleryImage.id, GalleryImage.gps_lat, GalleryImage.gps_lng, GalleryImage.taken_at).all(), origin)
+                total = len(ranked)
+                if offset == 0:
+                    # Counting tagged photos among these in SQL reads every located photo's
+                    # row; both id lists come from indexes alone.
+                    tagged = {i for (i,) in _owner_filter(
+                        db.query(GalleryImage.id).filter(GalleryImage.is_active == True, _HAS_AI_TAGS), user)}  # noqa: E712
+                    total_tagged = sum(1 for image_id, _km in ranked if image_id in tagged)
+                distances = dict(ranked[offset:offset + limit])
+                rows = page_rows([image_id for image_id, _km in ranked[offset:offset + limit]])
+            elif ranked_ids is not None:
                 # Keep similarity order across pages.
                 matching = {r[0] for r in q.with_entities(GalleryImage.id).all()}
-                page_ids = [i for i in ranked_ids if i in matching][offset:offset + limit]
-                page_rows = (
-                    db.query(GalleryImage, DbSession.name)
-                    .outerjoin(DbSession, GalleryImage.session_id == DbSession.id)
-                    .filter(GalleryImage.id.in_(page_ids or [""]))
-                    .all()
-                ) if page_ids else []
-                by_id = {img.id: (img, session_name) for img, session_name in page_rows}
-                rows = [by_id[i] for i in page_ids if i in by_id]
+                rows = page_rows([i for i in ranked_ids if i in matching][offset:offset + limit])
             elif sort == "shuffle":
                 # Seeded shuffle: fetch all matching IDs, shuffle them
                 # deterministically with `seed`, then re-query for just the
@@ -1445,19 +1474,7 @@ def setup_gallery_routes() -> APIRouter:
                 all_ids = [r[0] for r in id_rows]
                 rng = _random.Random(seed if seed is not None else 0)
                 rng.shuffle(all_ids)
-                page_ids = all_ids[offset:offset + limit]
-                if page_ids:
-                    page_rows = (
-                        db.query(GalleryImage, DbSession.name)
-                        .outerjoin(DbSession, GalleryImage.session_id == DbSession.id)
-                        .filter(GalleryImage.id.in_(page_ids))
-                        .all()
-                    )
-                    # Restore the shuffled order
-                    by_id = {img.id: (img, session_name) for img, session_name in page_rows}
-                    rows = [by_id[i] for i in page_ids if i in by_id]
-                else:
-                    rows = []
+                rows = page_rows(all_ids[offset:offset + limit])
             else:
                 taken = func.coalesce(GalleryImage.taken_at, GalleryImage.created_at)
                 q = q.add_columns(DbSession.name).outerjoin(DbSession, GalleryImage.session_id == DbSession.id)
@@ -1473,7 +1490,10 @@ def setup_gallery_routes() -> APIRouter:
 
             items = []
             for img, session_name in rows:
-                items.append(_image_to_dict(img, session_name))
+                item = _image_to_dict(img, session_name)
+                if distances is not None:
+                    item["distance_km"] = round(distances[img.id], 3)
+                items.append(item)
 
             result = {
                 "items": items,
