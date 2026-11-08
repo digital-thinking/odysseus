@@ -8,6 +8,10 @@ trip. Both are worked out again only after the library changed.
 "On this day" lists photos taken on today's date in earlier years. Opening a
 trip or a day in Photos is the ``since`` / ``until`` filter of
 /api/gallery/library.
+
+A trip can be renamed. The name is kept with the trip's days
+(gallery_trip_names), not with the trip, which only exists until the library
+changes: it goes to the trip that overlaps those days most.
 """
 
 import asyncio
@@ -15,15 +19,17 @@ import bisect
 import logging
 import re
 import threading
+import uuid
 from collections import Counter, defaultdict
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, Request
+from pydantic import BaseModel
 from sqlalchemy import func
 
-from core.database import GalleryAlbum, GalleryImage, SessionLocal
+from core.database import GalleryAlbum, GalleryImage, GalleryTripName, SessionLocal
 from routes.gallery.gallery_helpers import (
     NEWEST_KEY, TAKEN_KEY, _image_to_dict, _image_urls, _owner_filter, library_signature,
 )
@@ -217,6 +223,54 @@ def _cached_trips(user) -> Dict[str, Any]:
         db.close()
 
 
+MAX_NAME = 120
+
+
+def _trip_names(user) -> list:
+    db = SessionLocal()
+    try:
+        return [(n.start, n.end, n.name) for n in _owner_filter(db.query(GalleryTripName), user, GalleryTripName)
+                .order_by(GalleryTripName.updated_at)]
+    finally:
+        db.close()
+
+
+def with_names(trips: list, names: list) -> list:
+    """The trips with the names the user gave them (`name`).
+
+    A name goes to the trip that overlaps its days most, so it stays when a trip
+    gains or loses a day after new photos; a newer name for the same trip wins.
+    """
+    spans = [(datetime.fromisoformat(t["start"]), datetime.fromisoformat(t["end"])) for t in trips]
+    chosen: Dict[int, str] = {}
+    for start, end, name in names:   # oldest first
+        overlap, index = max(((min(end, t_end) - max(start, t_start), i) for i, (t_start, t_end) in enumerate(spans)),
+                             default=(timedelta(0), None))
+        if index is not None and overlap > timedelta(0):
+            chosen[index] = name
+    return [dict(t, name=chosen[i]) if i in chosen else t for i, t in enumerate(trips)]
+
+
+def _save_trip_name(user, start: datetime, end: datetime, name: str) -> None:
+    """Name the trip of these days; an empty name goes back to the one worked out."""
+    db = SessionLocal()
+    try:
+        # Earlier names of this trip (any that share a day with it) give way.
+        _owner_filter(db.query(GalleryTripName), user, GalleryTripName).filter(
+            GalleryTripName.start < end, GalleryTripName.end > start).delete(synchronize_session=False)
+        if name:
+            db.add(GalleryTripName(id=str(uuid.uuid4()), owner=user, start=start, end=end, name=name))
+        db.commit()
+    finally:
+        db.close()
+
+
+class TripNameBody(BaseModel):
+    start: str
+    end: str
+    name: str = ""
+
+
 def photos_on_this_day(db, user, day: date) -> List[Dict[str, Any]]:
     """Earlier years' photos taken on this month and day, newest year first."""
     month_day = f"{day.month:02d}-{day.day:02d}"
@@ -263,10 +317,25 @@ def register_trip_routes(router: APIRouter) -> None:
     async def gallery_trips(request: Request) -> Dict[str, Any]:
         user = get_current_user(request)
         try:
-            return await asyncio.to_thread(_cached_trips, user)
+            found = await asyncio.to_thread(_cached_trips, user)
+            names = await asyncio.to_thread(_trip_names, user)
         except Exception:
             logger.exception("Failed to work out trips")
             raise HTTPException(500, "Failed to work out trips")
+        return {"trips": with_names(found["trips"], names)}
+
+    @router.put("/api/gallery/trips/name")
+    async def gallery_trip_name(request: Request, body: TripNameBody) -> Dict[str, Any]:
+        """Rename the trip of these days (its `start` and `end`); an empty name undoes it."""
+        try:
+            start, end = datetime.fromisoformat(body.start), datetime.fromisoformat(body.end)
+        except ValueError:
+            raise HTTPException(400, "start and end must be ISO dates like 2024-08-12")
+        if end <= start:
+            raise HTTPException(400, "end must be after start")
+        name = " ".join(body.name.split())[:MAX_NAME]
+        await asyncio.to_thread(_save_trip_name, get_current_user(request), start, end, name)
+        return {"name": name or None}
 
     @router.get("/api/gallery/on-this-day")
     async def gallery_on_this_day(request: Request, day: str = Query(..., alias="date")) -> Dict[str, Any]:

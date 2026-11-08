@@ -189,6 +189,42 @@ def test_trips_are_worked_out_again_only_after_a_change(gallery, monkeypatch):
     assert len(_trips(gallery)) == 2 and runs == ["alice", "alice"]
 
 
+def test_a_renamed_trip_keeps_its_name(gallery):
+    _home_days(gallery, datetime(2024, 4, 1), 40, away={20, 21, 22, 30})
+    for d in (20, 21):
+        for h in range(5):
+            _photo(gallery, datetime(2024, 4, d, 9 + h), ROME)
+    for h in range(8):
+        _photo(gallery, datetime(2024, 4, 30, 9 + h), FLORENCE)
+    rome = next(t for t in _trips(gallery) if t["main_place"] == "Rome")
+    client = gallery["client"]
+
+    resp = client.put("/api/gallery/trips/name",
+                      json={"start": rome["start"], "end": rome["end"], "name": "  Rom   mit Anna "})
+    assert resp.status_code == 200 and resp.json() == {"name": "Rom mit Anna"}
+    names = {t["main_place"]: t.get("name") for t in _trips(gallery)}
+    assert names == {"Rome": "Rom mit Anna", "Florence": None}
+
+    # New photos make the trip a day longer: it keeps its name.
+    for h in range(4):
+        _photo(gallery, datetime(2024, 4, 22, 9 + h), FLORENCE)
+    longer = next(t for t in _trips(gallery) if t["start"] == rome["start"])
+    assert longer["end"] > rome["end"] and longer["name"] == "Rom mit Anna"
+
+    # Renamed again, then back to the name worked out.
+    client.put("/api/gallery/trips/name", json={"start": longer["start"], "end": longer["end"], "name": "Italien"})
+    assert [t.get("name") for t in _trips(gallery) if t["start"] == rome["start"]] == ["Italien"]
+    db = gallery["db"]()
+    assert db.execute(text("SELECT owner, name FROM gallery_trip_names")).fetchall() == [("alice", "Italien")]
+    db.close()
+    assert client.put("/api/gallery/trips/name",
+                      json={"start": longer["start"], "end": longer["end"], "name": ""}).json() == {"name": None}
+    assert all("name" not in t for t in _trips(gallery))
+
+    assert client.put("/api/gallery/trips/name", json={"start": "soon", "end": rome["end"]}).status_code == 400
+    assert client.put("/api/gallery/trips/name", json={"start": rome["end"], "end": rome["start"]}).status_code == 400
+
+
 def test_places_you_go_to_again_and_again_are_visits(gallery):
     _home_days(gallery, datetime(2024, 1, 1), 120, away={5, 12, 19, 26})
     for month in (1, 2, 3):

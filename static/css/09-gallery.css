@@ -1655,7 +1655,37 @@ path.gallery-map-hover { stroke: #fff; fill: var(--hl-function); fill-opacity: 0
 .gallery-trip-covers-3 { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
 .gallery-trip-covers-3 img:first-child { grid-row: span 2; }
 .gallery-trip-info { display: flex; flex-direction: column; gap: 2px; padding: 8px 10px 10px; min-width: 0; }
-.gallery-trip-title { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gallery-trip-head { display: flex; align-items: center; gap: 4px; min-width: 0; }
+.gallery-trip-title { flex: 1; min-width: 0; font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.gallery-trip-rename {
+  flex: none; display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 22px; padding: 0; margin: -3px -4px -3px 0;
+  background: none; border: none; border-radius: 6px; color: var(--fg); cursor: pointer;
+  opacity: 0; transition: opacity 0.12s, background 0.12s;
+}
+.gallery-trip-card:hover .gallery-trip-rename, .gallery-trip-card:focus-within .gallery-trip-rename { opacity: 0.6; }
+.gallery-trip-rename:hover, .gallery-trip-rename:focus-visible {
+  opacity: 1 !important; background: color-mix(in srgb, var(--fg) 10%, transparent);
+}
+@media (hover: none) { .gallery-trip-rename { opacity: 0.6; } }
+.gallery-trip-name-input {
+  flex: 1; min-width: 0; height: 24px; margin: -2px 0; padding: 0 6px;
+  font: inherit; font-size: 13px; font-weight: 600; color: var(--fg);
+  background: var(--bg); border: 1px solid var(--red); border-radius: 6px; outline: none;
+}
+.gallery-trip-renaming, .gallery-trip-renaming:hover { transform: none; cursor: default; }
+
+/* Back through the gallery's views (and the browser's Back) */
+.gallery-nav-back {
+  display: inline-flex; align-items: center; justify-content: center; flex: none;
+  width: 28px; height: 28px; padding: 0; margin-right: 6px;
+  background: none; border: 1px solid transparent; border-radius: 8px; color: var(--fg); cursor: pointer;
+  opacity: 0.75; transition: opacity 0.12s, background 0.12s, border-color 0.12s;
+}
+.gallery-nav-back:hover, .gallery-nav-back:focus-visible {
+  opacity: 1; background: color-mix(in srgb, var(--fg) 8%, transparent); border-color: var(--border);
+}
+.gallery-nav-back[hidden] { display: none; }
 .gallery-trip-when, .gallery-trip-meta { font-size: 11px; opacity: 0.6; }
 .gallery-trip-places { font-size: 11px; opacity: 0.85; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 

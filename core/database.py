@@ -422,6 +422,21 @@ class GalleryPerson(TimestampMixin, Base):
     cover_face_id = Column(String, nullable=True)
 
 
+class GalleryTripName(TimestampMixin, Base):
+    """A name the user gave a trip.
+
+    Trips are worked out from the photos again after each library change, so a
+    name is kept with the trip's days and goes to the trip that overlaps them most.
+    """
+    __tablename__ = "gallery_trip_names"
+
+    id    = Column(String, primary_key=True)
+    owner = Column(String, nullable=True, index=True)
+    start = Column(DateTime, nullable=False)   # the trip's first day
+    end   = Column(DateTime, nullable=False)   # the day after its last
+    name  = Column(String, nullable=False)
+
+
 class GalleryFace(TimestampMixin, Base):
     """One detected face: where it is, its embedding, and who it is (if known)."""
     __tablename__ = "gallery_faces"

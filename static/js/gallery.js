@@ -6,7 +6,7 @@ import uiModule from './ui.js?v=20260916largetoolscroll1';
 import { loadPanel } from './panels.js?v=20260909movepicklayer1';
 import spinnerModule from './spinner.js';
 import { makeWindowDraggable } from './windowDrag.js';
-import { bindMenuDismiss, dismissOrRemove } from './escMenuStack.js';
+import { bindMenuDismiss, dismissOrRemove, registerEscapeLayer } from './escMenuStack.js';
 import { topPortalZ } from './toolWindowZOrder.js';
 import sessionModule from './sessions.js';
 import fileHandlerModule from './fileHandler.js?v=20260909mobileattachmentedit1';
@@ -217,12 +217,43 @@ function _libraryParams() {
   return params;
 }
 
+let _listKey = null;        // the filters and sort of the list in _items (the search aside)
+let _listLoading = false;   // a new list is on its way
+
+// The list a set of parameters asks for. A search being typed counts as the same
+// list, so its earlier results stay up while the next ones load.
+function _listKeyOf(params) {
+  const p = new URLSearchParams(params);
+  p.delete('search');
+  p.delete('semantic');
+  return p.toString();
+}
+
 // startAt: show the list from this photo on (a timeline jump); 0 = from the top.
 async function _fetchLibrary(append, startAt = 0) {
+  // The old list's next page would be asked for with the new filters and mixed
+  // into the new list, and its answer would cancel the new list's.
+  if (append && _listLoading) return;
   const seq = ++_fetchSeq;
   // Recompute the page size each fetch so resizing / fullscreening the
   // window between loads pulls the right number of photos.
   _limit = _computeFetchLimit();
+  const params = _libraryParams();
+  if (!append) {
+    _listLoading = true;
+    const key = _listKeyOf(params);
+    if (key !== _listKey) {
+      // Another list (a trip, a person, another sort): until it arrives the grid
+      // would show the old photos under the new filter.
+      _listKey = key;
+      _items = [];
+      _total = 0;
+      _baseOffset = startAt;
+      const grid = document.getElementById('gallery-grid');
+      if (grid) grid.scrollTop = 0;
+    }
+    _navQueue();
+  }
   // First load with nothing on screen → show skeleton tiles instead of a blank
   // grid that then snaps to full. BUT: if the last successful load returned
   // zero items, skip the skeleton entirely — otherwise empty accounts flash
@@ -240,7 +271,6 @@ async function _fetchLibrary(append, startAt = 0) {
     // re-open. The new list replaces _items on success below; if the fetch
     // fails, the previous photos stay visible.
   }
-  const params = _libraryParams();
   params.set('offset', String(_offset));
   params.set('limit', String(_limit));
   try {
@@ -288,6 +318,14 @@ async function _fetchLibrary(append, startAt = 0) {
     else _syncTimelineMarker();
   } catch (e) {
     console.error('Gallery fetch error:', e);
+  } finally {
+    if (!append && seq === _fetchSeq) {
+      _listLoading = false;
+      if (!_items.length && document.querySelector('#gallery-grid .gallery-card-skeleton')) {
+        _listKey = null;   // it failed: the next try loads it again
+        _renderGrid();
+      }
+    }
   }
 }
 
@@ -1211,6 +1249,7 @@ async function _loadDetailFaces(img) {
 async function _renderPeopleTab() {
   const c = document.getElementById('gallery-people-container');
   if (!c) return;
+  _navQueue();   // one person or everyone
   if (_peopleView?.type === 'person') return _renderPersonView(c, _peopleView.id);
   if (_peopleView?.type === 'unknown') return _renderUnknownFaces(c);
   let data;
@@ -1965,6 +2004,11 @@ function _countryName(code) {
 }
 
 function _tripTitle(t) {
+  return t.name || _tripAutoTitle(t);
+}
+
+// The name worked out for a trip: its album, the countries abroad, or the main town.
+function _tripAutoTitle(t) {
   if (t.album) return t.album.name;
   const abroad = (t.countries || []).filter(c => c && c !== t.home_country);
   if (abroad.length) return abroad.map(_countryName).join(' & ');
@@ -2008,16 +2052,67 @@ function _tripCard(t, index) {
   const pics = covers.length >= 4 ? covers.slice(1, 4) : covers.slice(0, 3);
   const meta = [_plural(t.photos, 'photo')];
   if (t.far_km) meta.push(`${_formatDistance(t.far_km)} from home`);
+  // A div, not a button: the rename button sits inside it.
   return `
-    <button type="button" class="gallery-trip-card" data-trip="${index}" title="Show the photos of this trip">
+    <div class="gallery-trip-card" role="button" tabindex="0" data-trip="${index}" title="Show the photos of this trip">
       <span class="gallery-trip-covers gallery-trip-covers-${pics.length}">${pics.map(u => `<img src="${_esc(u)}" alt="" loading="lazy">`).join('')}</span>
       <span class="gallery-trip-info">
-        <span class="gallery-trip-title">${_esc(_tripTitle(t))}</span>
+        <span class="gallery-trip-head">
+          <span class="gallery-trip-title">${_esc(_tripTitle(t))}</span>
+          <button type="button" class="gallery-trip-rename" title="Rename this trip" aria-label="Rename ${_esc(_tripTitle(t))}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 20h9"/><path d="M16.5 3.5a2.1 2.1 0 0 1 3 3L7 19l-4 1 1-4Z"/></svg></button>
+        </span>
         <span class="gallery-trip-when">${_esc(_dateRangeText(t.start, t.end))} · ${_plural(t.days, 'day')}</span>
         ${t.places?.length ? `<span class="gallery-trip-places">${t.places.map(_esc).join(' · ')}</span>` : ''}
         <span class="gallery-trip-meta">${_esc(meta.join(' · '))}</span>
       </span>
-    </button>`;
+    </div>`;
+}
+
+// Rename a trip in place: Enter or leaving the field keeps the name, Esc keeps the
+// old one, and an empty name goes back to the one worked out.
+function _renameTrip(card, t) {
+  const title = card.querySelector('.gallery-trip-title');
+  if (!title || card.querySelector('.gallery-trip-name-input')) return;
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'gallery-trip-name-input';
+  input.maxLength = 120;
+  input.value = _tripTitle(t);
+  input.placeholder = _tripAutoTitle(t);
+  input.setAttribute('aria-label', 'Trip name (empty: the name worked out)');
+  title.replaceWith(input);
+  card.classList.add('gallery-trip-renaming');
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = async (keep) => {
+    if (done) return;
+    done = true;
+    const name = input.value.replace(/\s+/g, ' ').trim();
+    const c = document.getElementById('gallery-trips-container');
+    if (!keep || name === _tripTitle(t)) { if (c) _drawTrips(c); return; }
+    const before = t.name;
+    if (name && name !== _tripAutoTitle(t)) t.name = name; else delete t.name;
+    if (c) _drawTrips(c);
+    try {
+      const res = await _jsonFetch('/api/gallery/trips/name', {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ start: t.start, end: t.end, name: t.name || '' }),
+      });
+      if (res.name) t.name = res.name; else delete t.name;
+    } catch (err) {
+      if (before) t.name = before; else delete t.name;
+      uiModule.showError?.(`Could not rename the trip: ${err.message}`);
+    }
+    if (c) _drawTrips(c);
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    e.stopPropagation();   // typing a space or Enter must not open the trip
+  });
+  input.addEventListener('blur', () => finish(true));
+  input._cancel = () => finish(false);
 }
 
 function _drawTrips(c) {
@@ -2057,7 +2152,15 @@ async function _renderTripsTab() {
     c.addEventListener('click', (e) => {
       const card = e.target.closest('.gallery-trip-card');
       const trip = card && _tripsShown()[Number(card.dataset.trip)];
-      if (trip) _openTrip(trip);
+      if (!trip || e.target.closest('.gallery-trip-name-input')) return;
+      if (e.target.closest('.gallery-trip-rename')) _renameTrip(card, trip);
+      else _openTrip(trip);
+    });
+    c.addEventListener('keydown', (e) => {
+      if ((e.key === 'Enter' || e.key === ' ') && e.target.classList?.contains('gallery-trip-card')) {
+        e.preventDefault();
+        e.target.click();
+      }
     });
     c.addEventListener('change', (e) => {
       if (e.target.id !== 'gallery-trips-visits') return;
@@ -2156,6 +2259,210 @@ function _renderMemories() {
     });
   }
   el.hidden = false;
+}
+
+// ---- Browser history ----
+// Each gallery view (tab, Photos filters and sort, open photo, person, slideshow)
+// is a history entry, so the browser's Back and Forward and the ← button in the
+// gallery header step through them. An entry is { odyGallery: { depth, view } }:
+// depth counts the entries since the gallery was opened, so closing it steps back
+// over all of them at once and Back afterwards leaves the page as before.
+
+let _navRestoring = false;   // putting an entry's view back: no new entries meanwhile
+let _navQueued = false;
+let _navFresh = false;       // the gallery was just opened: its first entry
+let _detailId = null;        // the photo in the detail view
+let _detailEscLayer = null;  // its entry in the app's Esc stack
+
+function _activeTab() {
+  return document.querySelector('#gallery-modal .gallery-tab.active')?.dataset.tab || 'images';
+}
+
+function _navView() {
+  const detail = document.getElementById('gallery-detail');
+  return {
+    tab: _activeTab(),
+    sort: _sort,
+    seed: _sort === 'shuffle' ? _shuffleSeed : null,
+    search: _search,
+    tags: _activeTags,
+    model: _activeModel,
+    album: _activeAlbum,
+    favorites: _favoritesOnly,
+    folder: _activeFolder,
+    people: _activePeople,
+    exactTag: _activeExactTag,
+    similar: _activeSimilar,
+    near: _activeNear,
+    dates: _activeDates,
+    person: _activeTab() === 'people' ? _peopleView : null,
+    detail: detail && detail.style.display !== 'none' ? _detailId : null,
+    show: !!_show,
+  };
+}
+
+// The Photos list of a view: everything but where it is looked at.
+function _navList(v) {
+  const { tab, person, detail, show, ...list } = v;
+  return JSON.stringify(list);
+}
+
+// Typing on in the search box, or the next photo in the detail view, updates the
+// entry instead of adding one.
+function _navMinor(a, b) {
+  const without = (v, key) => JSON.stringify({ ...v, [key]: null });
+  if (a.search && b.search && without(a, 'search') === without(b, 'search')) return true;
+  if (a.detail && b.detail && without(a, 'detail') === without(b, 'detail')) return true;
+  return false;
+}
+
+// Record the view once the current change is done (a click can switch the tab and
+// the filters together: one entry).
+function _navQueue() {
+  if (_navRestoring || _navQueued || !_open) return;
+  _navQueued = true;
+  queueMicrotask(_navCommit);
+}
+
+function _navCommit() {
+  _navQueued = false;
+  if (_navRestoring || !_open || !document.getElementById('gallery-modal')) return;
+  const view = _navView();
+  const cur = history.state?.odyGallery;
+  try {
+    if (_navFresh || !cur) {
+      _navFresh = false;
+      history.pushState({ odyGallery: { depth: 0, view } }, '');
+    } else if (JSON.stringify(cur.view) !== JSON.stringify(view)) {
+      if (_navMinor(cur.view, view)) {
+        history.replaceState({ odyGallery: { ...cur, view } }, '');
+      } else {
+        // Where the view being left was scrolled to, for coming back to it.
+        history.replaceState({ odyGallery: { ...cur, scroll: { ..._navScrollPos } } }, '');
+        history.pushState({ odyGallery: { depth: cur.depth + 1, view } }, '');
+      }
+    }
+  } catch (err) {
+    console.warn('Gallery: browser history not updated', err);
+  }
+  _navSyncBack();
+}
+
+// Scroll positions as last seen (a tab switch moves them before the entry is
+// recorded): the tabs scroll in .modal-body, Photos in its grid.
+const _navScrollPos = { body: 0, grid: 0 };
+document.addEventListener('scroll', (e) => {
+  const t = e.target;
+  if (!_open || !t?.closest?.('#gallery-modal')) return;
+  if (t.id === 'gallery-grid') _navScrollPos.grid = t.scrollTop;
+  else if (t.classList.contains('modal-body')) _navScrollPos.body = t.scrollTop;
+}, { capture: true, passive: true });
+
+function _navRestoreScroll(scroll) {
+  if (!scroll) return;
+  requestAnimationFrame(() => {
+    const body = document.querySelector('#gallery-modal .modal-body');
+    if (body) body.scrollTop = scroll.body || 0;
+    const grid = document.getElementById('gallery-grid');
+    if (grid && !_listLoading) grid.scrollTop = scroll.grid || 0;   // a list being loaded again starts at the top
+  });
+}
+
+function _navSyncBack() {
+  const btn = document.getElementById('gallery-nav-back');
+  if (btn) btn.hidden = !(history.state?.odyGallery?.depth > 0);
+}
+
+// The gallery was closed from inside it: step back to where the page was before.
+function _navLeave() {
+  const s = history.state?.odyGallery;
+  if (s) history.go(-(s.depth + 1));
+}
+
+// Close a view that has its own entry (the photo, the slideshow) by going back, so
+// Forward can bring it again; without one, close it directly.
+function _navBackFrom(key, close) {
+  if (!_navRestoring && history.state?.odyGallery?.view?.[key]) history.back();
+  else close();
+}
+
+async function _navShowPhoto(id) {
+  let img = _items.find(i => String(i.id) === String(id));
+  if (!img) {
+    try {
+      const data = await _jsonFetch(`/api/gallery/${encodeURIComponent(id)}`);
+      img = data.image || data;
+    } catch (_) { /* deleted since: stay on the list */ }
+  }
+  if (!img?.id || history.state?.odyGallery?.view?.detail !== id) return;
+  _navRestoring = true;
+  try { _openDetail(img); } finally { _navRestoring = false; }
+}
+
+// Put an entry's view back.
+function _navApply(v) {
+  const listChanged = _navList(v) !== _navList(_navView());
+  _sort = v.sort || 'recent';
+  if (v.seed != null) _shuffleSeed = v.seed;
+  _search = v.search || '';
+  _activeTags = [...(v.tags || [])];
+  _activeModel = v.model ?? null;
+  _activeAlbum = v.album ?? null;
+  _favoritesOnly = !!v.favorites;
+  _activeFolder = v.folder ?? null;
+  _activePeople = [...(v.people || [])];
+  _activeExactTag = v.exactTag ?? null;
+  _activeSimilar = v.similar ?? null;
+  _activeNear = v.near ?? null;
+  _activeDates = v.dates ?? null;
+  const setValue = (id, value) => { const el = document.getElementById(id); if (el) el.value = value; };
+  setValue('gallery-search', _search);
+  setValue('gallery-sort', _sort);
+  setValue('gallery-model-filter', _activeModel || '');
+  setValue('gallery-folder-filter', _activeFolder ? `${_activeFolder.source}|${_activeFolder.path}` : '');
+
+  if (!v.show && _show) _stopSlideshow();
+  const tab = document.querySelector(`#gallery-modal .gallery-tab[data-tab="${v.tab}"]`);
+  if (tab && !tab.classList.contains('active')) tab.click();   // also closes the photo
+  if (v.tab === 'people' && JSON.stringify(_peopleView) !== JSON.stringify(v.person ?? null)) {
+    _peopleView = v.person ?? null;
+    _renderPeopleTab();
+  }
+  if (listChanged) _fetchLibrary(false);
+  _renderAlbums();   // the filter pills
+  const detail = document.getElementById('gallery-detail');
+  if (v.detail) {
+    if (_detailId !== v.detail || detail?.style.display === 'none') _navShowPhoto(v.detail);
+  } else if (detail && detail.style.display !== 'none') {
+    detail.style.display = 'none';
+  }
+}
+
+window.addEventListener('popstate', (e) => {
+  const s = e.state?.odyGallery;
+  if (!s) {
+    if (!_open) return;
+    _navRestoring = true;
+    try { closeGallery(); } finally { _navRestoring = false; }
+    // Still open (an edit in progress keeps it): put its entry back.
+    if (_open) history.pushState({ odyGallery: { depth: 0, view: _navView() } }, '');
+    return;
+  }
+  _navRestoring = true;
+  try {
+    if (!_open || !document.getElementById('gallery-modal')) openGallery();
+    else if (Modals.isMinimized('gallery-modal')) Modals.restore('gallery-modal');
+    _navApply(s.view);
+  } finally {
+    _navRestoring = false;
+  }
+  _navRestoreScroll(s.scroll);
+  _navSyncBack();
+});
+
+// A reload leaves the last entry's state behind while the gallery starts closed.
+if (history.state?.odyGallery) {
+  try { history.replaceState(null, ''); } catch (_) { /* nothing to tidy then */ }
 }
 
 // ---- Timeline beside the photo grid ----
@@ -2302,7 +2609,7 @@ async function _jumpTo(offset) {
 
 // Scrolled back up after a jump: put the page before it above, keeping the view still.
 async function _loadNewer() {
-  if (_loadingNewer || _baseOffset <= 0) return;
+  if (_loadingNewer || _baseOffset <= 0 || _listLoading) return;
   _loadingNewer = true;
   const seq = _fetchSeq;
   const start = Math.max(0, _baseOffset - _computeFetchLimit());
@@ -2521,7 +2828,7 @@ function _startSlideshow(startAt = 0) {
     else if (act === 'next') _slideStep(1);
     else if (act === 'play') _slidePlay(!s.playing);
     else if (act === 'full') _slideFullscreen();
-    else if (act === 'close') _stopSlideshow();
+    else if (act === 'close') _navBackFrom('show', _stopSlideshow);
     else if (!e.target.closest('.gallery-slideshow-bar')) {
       // A swipe goes back or forward; a tap pauses or plays.
       const dx = downX === null ? 0 : e.clientX - downX;
@@ -2544,7 +2851,7 @@ function _startSlideshow(startAt = 0) {
     else if (key === 'ArrowRight' || key === 'l') _slideStep(1);
     else if (key === 'ArrowLeft' || key === 'j') _slideStep(-1);
     else if (key === 'f' || key === 'F') _slideFullscreen();
-    else if (key === 'Escape') _stopSlideshow();
+    else if (key === 'Escape') _navBackFrom('show', _stopSlideshow);
     else handled = false;
     if (handled) {
       e.preventDefault();
@@ -2557,6 +2864,7 @@ function _startSlideshow(startAt = 0) {
   el.focus();
   _slideWake();
   _slideTo(startAt);
+  _navQueue();
 }
 
 function _stopSlideshow() {
@@ -3863,13 +4171,26 @@ function _openDetail(img) {
     </div>
   `;
   detail.style.display = 'flex';
+  _detailId = img.id;
+  _navQueue();
+  // An inner layer for the app's Esc handling (ui.js), which otherwise closes the
+  // whole gallery under the pointer: Esc closes the photo first.
+  if (!_detailEscLayer) {
+    _detailEscLayer = registerEscapeLayer(
+      () => { _detailEscLayer = null; document.getElementById('gallery-detail-back')?.click(); },
+      () => {
+        const open = _open && detail.isConnected && detail.style.display !== 'none';
+        if (!open) _detailEscLayer = null;   // dropped from the stack
+        return open;
+      });
+  }
 
   document.getElementById('gallery-slideshow-btn')?.addEventListener('click', () => {
     const at = _items.findIndex(i => i.id === img.id);
     _startSlideshow(at >= 0 ? _baseOffset + at : 0);
   });
   document.getElementById('gallery-detail-back').addEventListener('click', () => {
-    detail.style.display = 'none';
+    _navBackFrom('detail', () => { detail.style.display = 'none'; _navQueue(); });
   });
 
   const _openSourceChat = async () => {
@@ -4479,6 +4800,7 @@ export function openGallery() {
   modal.innerHTML = `
     <div class="modal-content gallery-modal-content">
       <div class="modal-header">
+        <button type="button" class="gallery-nav-back" id="gallery-nav-back" title="Back (Alt+←)" aria-label="Back" hidden><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
         <h4><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-2px;margin-right:6px"><rect x="3" y="3" width="18" height="18" rx="2"/><circle cx="8.5" cy="8.5" r="1.5"/><path d="M21 15l-5-5L5 21"/></svg>Gallery <span id="gallery-stats" class="memory-count" style="font-size:0.6em;opacity:0.6;font-weight:normal;margin-left:8px"></span></h4>
         <button class="modal-close" id="gallery-close">&times;</button>
       </div>
@@ -4644,6 +4966,8 @@ export function openGallery() {
   // so the two coexist.
   _makeGalleryDraggable(modal.querySelector('.modal-content'));
 
+  document.getElementById('gallery-nav-back').addEventListener('click', () => history.back());
+
   document.getElementById('gallery-close').addEventListener('click', async () => {
     if (isEditorOpen()) {
       const ok = await uiModule.styledConfirm(
@@ -4766,6 +5090,7 @@ export function openGallery() {
         // tab does something useful instead of opening an empty grey pane.
         if (!isEditorOpen()) _renderEditorLanding();
       }
+      _navQueue();
     });
   });
 
@@ -5455,6 +5780,14 @@ export function openGallery() {
 
   _escHandler = (e) => {
     if (e.key === 'Escape') {
+      // Renaming a trip: Esc keeps the old name.
+      const renaming = document.activeElement?.closest?.('#gallery-modal .gallery-trip-name-input');
+      if (renaming) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        renaming._cancel?.();
+        return;
+      }
       if (window.__galleryCancelSelection?.()) {
         e.preventDefault();
         e.stopImmediatePropagation();
@@ -5538,7 +5871,9 @@ export function openGallery() {
   //    fetch fails or takes a moment, the cached view sticks around.
   _fetchAlbums();
   _fetchFolders();
+  _navFresh = !_navRestoring;   // its first history entry (taken after the fetch below sets up the list)
   _fetchLibrary(false);
+  _navQueue();
   _loadMemories();
   // Desktop keeps the convenient type-to-search behavior. On mobile this
   // immediately opened the keyboard and dropped the user into Search before
@@ -5625,6 +5960,7 @@ function _doCloseGallery() {
     return;
   }
   _open = false;
+  if (!_navRestoring) _navLeave();
   _stopSlideshow();
   clearTimeout(_searchDebounce);
   if (_galleryResizeHandler) {
